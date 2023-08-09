@@ -67,7 +67,7 @@ foreach ($storageAccount in $storageAccounts) {
                     SubscriptionName   = $context.Subscription.Name
                     ResourceGroupName  = $storageAccount.ResourceGroupName
                     StorageAccountName = $storageAccount.StorageAccountName
-                    StorageAccountTags = $storageAccount.Tags
+                    StorageAccountTags = $($storageAccount.Tags | ConvertTo-Json).ToString()
                     Container          = $container.Name
                     Name               = $blob.Name
                     BlobType           = $blob.BlobType
@@ -88,6 +88,6 @@ foreach ($storageAccount in $storageAccounts) {
     }
 }
 
-#$blobInventory | Export-Csv -Path ".\StorageAccountBlobInventory.csv" -NoTypeInformation
-$blobInventory
+$blobInventory | Export-Csv -Path ".\StorageAccountBlobInventory.csv" -NoTypeInformation -Force
+#$blobInventory
 
