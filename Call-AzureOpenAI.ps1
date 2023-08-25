@@ -1,7 +1,7 @@
 ### Call Azure OpenAI with PowerShell
 ### This script is not very smart, it just calls the API 100 times with the same body
 
-#$token is used with AAD auth
+#$token is used with AAD auth, it assumes that you are logged in with Connect-AzAccount
 $token = Get-AzAccessToken -ResourceUrl "https://cognitiveservices.azure.com"
 
 #$key is used with API key auth
