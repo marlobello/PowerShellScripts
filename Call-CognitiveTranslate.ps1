@@ -1,9 +1,9 @@
+#$token is used with AAD auth, it assumes that you are logged in with Connect-AzAccount
 $token = Get-AzAccessToken -ResourceUrl "https://cognitiveservices.azure.com"
 
-#$key = "ccd54aa75663485990f889302caf4b6c"
-#$endpoint = "https://api.cognitive.microsofttranslator.com"
-#$endpoint = "https://test-cogsvc.cognitiveservices.azure.com"
-$endpoint = "https://cog.cloud.marlo.bellz.com"
+#$key is used with API key auth
+#$key = "accesskeyFromTheAzurePortal" #please roll your key after testing
+
 $region = "eastus"
 
 #$route = "/translate?api-version=3.0&to=de";
@@ -15,12 +15,14 @@ $body = @{
 
 $body = $body | ConvertTo-Json -AsArray
 
+# API key auth headers
 #$headers = @{
 #   "Ocp-Apim-Subscription-Key"    = $key
 #   "Ocp-Apim-Subscription-Region" = $region
 #   "Content-Type"                 = "application/json"
 #}
 
+# AAD auth headers
 $headers = @{
     "Authorization"                = "$($token.Type) $($token.Token)"
     "Ocp-Apim-Subscription-Region" = $region
