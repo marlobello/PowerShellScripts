@@ -8,7 +8,7 @@ $token = Get-AzAccessToken -ResourceUrl "https://cognitiveservices.azure.com"
 #$key = "accesskeyFromTheAzurePortal" #please roll your key after testing
 
 $endpoint = "endpointFromTheAzurePortal"
-$deployment = "deploymentnamefromAzureAIStudio"
+$deployment = "deploymentNameFromAzureAIStudio"
 
 $route = "/openai/deployments/" + $deployment + "/chat/completions?api-version=2023-03-15-preview"
 
