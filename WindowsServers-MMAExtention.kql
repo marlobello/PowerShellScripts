@@ -1,0 +1,6 @@
+resources
+| where type == "microsoft.compute/virtualmachines" and properties.storageProfile.osDisk.osType == "Windows"
+| project id, subscriptionId, resourceGroup, name, os = properties.storageProfile.osDisk.osType
+| join (resources | where type == "microsoft.compute/virtualmachines/extensions" | project vmResourceId = tostring(split(id,"/extensions/")[0]), extensionResourceId = id, exentensionPublisher = properties.publisher, extensionType = properties.type) on $left.id == $right.vmResourceId
+| where extensionType == "MicrosoftMonitoringAgent"
+| sort by subscriptionId
