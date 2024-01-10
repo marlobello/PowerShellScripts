@@ -22,7 +22,7 @@ $headers = @{
 #    "Content-Type"  = "application/json"
 #}
 
-$endpoint = "https://chatcegdev.constellation.com"
+$endpoint = "https://chat.testing.com"
 $deployment = "dev-chatCEG"
 
 $route = "/openai/deployments/" + $deployment + "/chat/completions?api-version=2023-08-01-preview"
