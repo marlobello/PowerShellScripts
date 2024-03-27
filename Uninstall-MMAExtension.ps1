@@ -35,5 +35,27 @@ foreach($Server in $WindowsServersWithMMA)
     }
 
     Remove-AzVMExtension -ResourceGroupName $Server.resourceGroup -VMName $Server.name -Name "MicrosoftMonitoringAgent" -Force -AsJob
+}
 
+
+# resource graph query to get all Linux Servers with the MMA extension
+$LinuxServersWithMMA = Search-AzGraph -Query 'resources
+| where type == "microsoft.compute/virtualmachines" and properties.storageProfile.osDisk.osType == "Linux"
+| project id, subscriptionId, resourceGroup, name, os = properties.storageProfile.osDisk.osType
+| join (resources | where type == "microsoft.compute/virtualmachines/extensions" | project vmResourceId = tostring(split(id,"/extensions/")[0]), extensionResourceId = id, exentensionPublisher = properties.publisher, extensionType = properties.type) on $left.id == $right.vmResourceId
+| where extensionType == "OmsAgentForLinux"
+| sort by subscriptionId'
+
+foreach($Server in $LinuxServersWithMMA)
+{
+    
+    #check current subscription context
+    $context = Get-AzContext
+    if($context.Subscription.Id -ne $Server.subscriptionId)
+    {
+        #set the current subscription
+        Set-AzContext -Subscription $Server.subscriptionId
+    }
+
+    Remove-AzVMExtension -ResourceGroupName $Server.resourceGroup -VMName $Server.name -Name "OmsAgentForLinux" -Force -AsJob
 }
