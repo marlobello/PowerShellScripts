@@ -24,7 +24,7 @@ The region of the target resource where the alert rule will be applied to.
 The friendly name of the target resource type where the alert rule will be copied to (e.g., "sql" or "vm").
 
 .EXAMPLE
-.\Copy-InfrastructureAlertRules.ps1 -AlertRuleSubscriptionName "SourceSubscription" -AlertRuleResourceGroupName "SourceResourceGroup" -ExampleAlertRuleName "ExampleAlertRule" -TargetResourceSubscriptionName "TargetSubscription" -TargetResourceRegion "eastus" -TargetResourceTypeFriendlyName "vm"
+.\Copy-MetricAlertRule.ps1 -AlertRuleSubscriptionName "SourceSubscription" -AlertRuleResourceGroupName "SourceResourceGroup" -ExampleAlertRuleName "ExampleAlertRule" -TargetResourceSubscriptionName "TargetSubscription" -TargetResourceRegion "eastus" -TargetResourceTypeFriendlyName "vm"
 
 This example copies an alert rule named "ExampleAlertRule" from the "SourceSubscription" subscription to the "TargetSubscription" subscription in the "eastus" region.
 
