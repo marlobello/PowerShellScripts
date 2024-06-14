@@ -78,12 +78,12 @@ if(!$context)
     Connect-AzAccount
 }
 
-Set-AzContext -SubscriptionName $TargetResourceSubscriptionName
+Set-AzContext -SubscriptionName $TargetResourceSubscriptionName | Out-Null
 
 $TargetSubscriptionId = (Get-AzContext).Subscription.Id
 
 # Select the target subscription
-Set-AzContext -SubscriptionName $AlertRuleSubscriptionName
+Set-AzContext -SubscriptionName $AlertRuleSubscriptionName | Out-Null
 
 # Get example alert rule
 $alert = Get-AzMetricAlertRuleV2 -ResourceGroupName $AlertRuleResourceGroupName -Name $ExampleAlertRuleName
