@@ -78,11 +78,11 @@ if(!$context)
     Connect-AzAccount
 }
 
+# Get the target subscription ID
 Set-AzContext -SubscriptionName $TargetResourceSubscriptionName | Out-Null
-
 $TargetSubscriptionId = (Get-AzContext).Subscription.Id
 
-# Select the target subscription
+# Select the monitoring subscription
 Set-AzContext -SubscriptionName $AlertRuleSubscriptionName | Out-Null
 
 # Get example alert rule
