@@ -4,14 +4,13 @@ param (
     [int]
     $CurrentSpend,
     [Parameter()]
-    [int]
-    $DaysDelayed = 3
+    [float]
+    $CurrentDay = (Get-Date).Day
 )
 
 $daysInMonth = [System.DateTime]::DaysInMonth((Get-Date).Year, (Get-Date).Month)
-$currentDay = (Get-Date).Day - $DaysDelayed
 
-$projectedSpend = $CurrentSpend / $currentDay * $daysInMonth
+$projectedSpend = $CurrentSpend / $CurrentDay * $daysInMonth
 
 $projectedSpend = [math]::Round($projectedSpend, 2)
 
