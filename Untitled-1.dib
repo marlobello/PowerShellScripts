@@ -1,0 +1,79 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"pwsh","items":[{"aliases":[],"languageName":"pwsh","name":"pwsh"}]}}
+
+#!markdown
+
+# My First Polygot Notebook
+## Let's test out some simple Azure PowerShell
+
+#!pwsh
+
+$subs = Get-AzSubscription
+$subs
+
+#!pwsh
+
+Select-AzSubscription -SubscriptionName "Bravo"
+
+#!pwsh
+
+$ctx = Get-AzContext
+
+#!pwsh
+
+$ctx.Tenant.Id
+
+#!markdown
+
+## Let's try out something a little more interesting
+
+#!csharp
+
+var name = "Marlo";
+(1+1).Display();
+name.Display();
+
+#!csharp
+
+var displayRef =  "initial value".Display(); 
+System.Threading.Thread.Sleep(10000); 
+displayRef.Update("different value");
+
+#!csharp
+
+Console.WriteLine(name);
+
+#!pwsh
+
+#!set --value @csharp:name --name nameFromCSharp
+
+$nameFromCSharp
+
+#!csharp
+
+#!set --value @pwsh:ctx --name ctx
+
+Console.WriteLine(ctx.ToString());
+
+#!csharp
+
+#!set --name url --value @input:"Please enter a URL"
+
+#!csharp
+
+#!value --name testValue
+"Phoenix"
+
+#!pwsh
+
+#!set --name city --value @value:testValue
+$city
+
+#!csharp
+
+#r "nuget:Microsoft.DotNet.Interactive.Kql,1.0.0-beta.25110.2"
+
+#!kql
+
+Events | Take 10
