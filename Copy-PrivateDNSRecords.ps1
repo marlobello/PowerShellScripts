@@ -16,7 +16,7 @@ even if Microsoft has been advised of the possibility of such damages. #>
 
 param (
     [Parameter(Mandatory = $true)]
-    [string[]]$PrivateZoneNamesFile,
+    [string]$PrivateZoneNamesFile,
 
     [Parameter(Mandatory = $true)]
     [string]$SourceTenantId,
