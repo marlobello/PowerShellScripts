@@ -1,0 +1,7 @@
+@token=
+
+GET https://hbteststroageaccount.blob.core.windows.net/test/NVIDIA_app_v11.0.5.245.exe?comp=blocklist HTTP/1.1
+x-ms-version: 2025-07-05
+Authorization: Bearer {{token}}
+Accept: */*
+accept-encoding: gzip, deflate
