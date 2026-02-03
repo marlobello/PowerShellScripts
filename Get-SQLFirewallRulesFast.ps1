@@ -1,53 +1,112 @@
-<# THIS CODE-SAMPLE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESSED 
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY AND/OR 
-FITNESS FOR A PARTICULAR PURPOSE.
+<# 
+.SYNOPSIS
+    Retrieves SQL Server firewall rules across subscriptions using Azure Resource Graph.
 
-This sample is not supported under any Microsoft standard support program or service. 
-The script is provided AS IS without warranty of any kind. Microsoft further disclaims all
-implied warranties including, without limitation, any implied warranties of merchantability
-or of fitness for a particular purpose. The entire risk arising out of the use or performance
-of the sample and documentation remains with you. In no event shall Microsoft, its authors,
-or anyone else involved in the creation, production, or delivery of the script be liable for 
-any damages whatsoever (including, without limitation, damages for loss of business profits, 
-business interruption, loss of business information, or other pecuniary loss) arising out of 
-the use of or inability to use the sample or documentation, even if Microsoft has been advised 
-of the possibility of such damages, rising out of the use of or inability to use the sample script, 
-even if Microsoft has been advised of the possibility of such damages. #>
+.DESCRIPTION
+    This script efficiently queries all SQL Server firewall rules across subscriptions
+    using Azure Resource Graph for optimal performance. Only queries subscriptions that
+    contain SQL Servers.
 
-$SQLFirewallRules = @()
+.PARAMETER ExportPath
+    Optional. Path to export results to CSV. Defaults to .\SQLFirewallRules.csv
 
-# resource graph query to get all SQL Servers
-$SQLServers = Search-AzGraph -Query "resources | where type =~ 'Microsoft.Sql/servers' | sort by subscriptionId | project subscriptionId"
+.PARAMETER AllSubscriptions
+    Switch to query all accessible subscriptions. If not specified, uses current context.
 
-#iterate through each subscription WHICH ACTUALLY HAS A SQL SERVER
-foreach($SQLServer in $SQLServers)
-{
+.PARAMETER SubscriptionId
+    Optional. Specific subscription ID to query.
+
+.EXAMPLE
+    .\Get-SQLFirewallRulesFast.ps1
+    Exports SQL firewall rules from current subscription to SQLFirewallRules.csv
+
+.EXAMPLE
+    .\Get-SQLFirewallRulesFast.ps1 -AllSubscriptions -ExportPath "C:\reports\firewall-rules.csv"
+    Exports SQL firewall rules from all subscriptions to specified path.
+
+.NOTES
+    THIS CODE-SAMPLE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESSED 
+    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY AND/OR 
+    FITNESS FOR A PARTICULAR PURPOSE.
+#>
+
+[CmdletBinding()]
+param (
+    [Parameter()]
+    [string]$ExportPath = ".\SQLFirewallRules.csv",
     
-    #check current subscription context
-    $context = Get-AzContext
-    if($context.Subscription.Id -ne $SQLServer.subscriptionId)
-    {
-        #set the current subscription
-        Set-AzContext -Subscription $SQLServer.subscriptionId
+    [Parameter()]
+    [switch]$AllSubscriptions,
+    
+    [Parameter()]
+    [string]$SubscriptionId
+)
+
+try {
+    Write-Host "Finding SQL Servers..." -ForegroundColor Cyan
+    
+    # Build query to get all SQL firewall rules using Resource Graph
+    $query = @"
+resources
+| where type =~ 'Microsoft.Sql/servers/firewallRules'
+| extend serverName = tostring(split(id, '/')[8])
+| extend ruleName = name
+| project 
+    subscriptionId,
+    resourceGroup,
+    serverName,
+    ruleName,
+    startIpAddress = properties.startIpAddress,
+    endIpAddress = properties.endIpAddress,
+    location
+| order by subscriptionId asc, resourceGroup asc, serverName asc, ruleName asc
+"@
+    
+    $subscriptions = @()
+    
+    if ($SubscriptionId) {
+        $subscriptions = @($SubscriptionId)
+        Write-Verbose "Querying subscription: $SubscriptionId"
+        $firewallRules = Search-AzGraph -Query $query -Subscription $subscriptions -First 1000
     }
-
-    #get all SQL servers
-    $sqlservers = Get-AzSqlServer
-
-    #iterate through each SQL server
-    foreach($sqlserver in $sqlservers)
-    {
-        #get all firewall rules for the SQL server
-        $firewallrules = Get-AzSqlServerFirewallRule -ServerName $sqlserver.ServerName -ResourceGroupName $sqlserver.ResourceGroupName
-
-        #iterate through each firewall rule
-        foreach($firewallrule in $firewallrules)
-        {
-            #write the firewall rule to the console
-            #Write-Output $firewallrule | Format-Table -Property ResourceGroupName, ServerName, FirewallRuleName, StartIpAddress, EndIpAddress
-            $SQLFirewallRules += $firewallrule
-        }
+    elseif ($AllSubscriptions) {
+        Write-Verbose "Querying all accessible subscriptions"
+        $firewallRules = Search-AzGraph -Query $query -First 1000
+    }
+    else {
+        $context = Get-AzContext -ErrorAction Stop
+        $subscriptions = @($context.Subscription.Id)
+        Write-Verbose "Querying current subscription: $($context.Subscription.Name)"
+        $firewallRules = Search-AzGraph -Query $query -Subscription $subscriptions -First 1000
+    }
+    
+    # Handle pagination if needed
+    while ($firewallRules.SkipToken) {
+        Write-Verbose "Fetching additional results..."
+        $moreResults = Search-AzGraph -Query $query -Subscription $subscriptions -First 1000 -SkipToken $firewallRules.SkipToken
+        $firewallRules += $moreResults
+    }
+    
+    if ($firewallRules -and $firewallRules.Count -gt 0) {
+        Write-Host "Found $($firewallRules.Count) SQL Server firewall rule(s)" -ForegroundColor Green
+        
+        $firewallRules | Export-Csv -Path $ExportPath -NoTypeInformation -Force
+        Write-Host "Results exported to: $ExportPath" -ForegroundColor Green
+        
+        # Display summary
+        Write-Host "`nSummary by SQL Server:" -ForegroundColor Cyan
+        $firewallRules | Group-Object serverName | 
+            Select-Object Name, Count | 
+            Sort-Object Count -Descending |
+            Format-Table -AutoSize
+        
+        return $firewallRules
+    }
+    else {
+        Write-Host "No SQL Server firewall rules found" -ForegroundColor Yellow
     }
 }
-
-$SqlFirewallRules | Export-Csv -Path ".\SQLFirewallRules.csv" -NoTypeInformation
+catch {
+    Write-Error "An error occurred: $_"
+    throw
+}
