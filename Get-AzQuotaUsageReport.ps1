@@ -435,6 +435,23 @@ function Get-SubscriptionQuotaData {
 
         Write-Host "  Querying: $($subscription.Name) ($SubscriptionId)"
 
+        # ── Resource provider registration check ────────────────────────────────
+        # Microsoft.Compute must be registered — without it no quota, SKU, or zone
+        # data is available. Get-AzResourceProvider returns one row per resource type
+        # so we take the first row's RegistrationState as the provider-level answer.
+        # Microsoft.Quota is NOT checked here: the provider can be listed as
+        # "NotRegistered" yet the Quota API still responds (it is a platform-level
+        # endpoint, not a per-subscription resource deployment). The existing fallback
+        # to Get-AzVMUsage handles any case where the Quota API does not respond.
+        $computeProvider = Get-AzResourceProvider -ProviderNamespace Microsoft.Compute `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+
+        if ($computeProvider.RegistrationState -ne 'Registered') {
+            $state = if ($computeProvider) { $computeProvider.RegistrationState } else { 'unknown' }
+            Write-Warning "Skipping subscription '$($subscription.Name)': Microsoft.Compute is not registered (state: '$state'). Register it with: Register-AzResourceProvider -ProviderNamespace Microsoft.Compute"
+            return @()
+        }
+
         # Get zone mapping (logical → physical) for this subscription + region
         $zonePeers = Get-ZonePeers -SubscriptionId $SubscriptionId -Region $Region -ResourceManagerUrl $ResourceManagerUrl
 
