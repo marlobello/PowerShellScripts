@@ -554,8 +554,19 @@ function Get-QuotaGroupDetails {
             if ($subAllocResp -and $subAllocResp.StatusCode -eq 200) {
                 $subShareable = @{}
                 foreach ($entry in ($subAllocResp.Content | ConvertFrom-Json).value) {
-                    if ($null -ne $entry.properties.shareableQuota) {
-                        $subShareable[$entry.properties.resourceName] = [int]$entry.properties.shareableQuota
+                    # Resource name: try properties.resourceName, then properties.name.value,
+                    # then fall back to the top-level name (may be a short name or full path).
+                    $resourceName = $entry.properties.resourceName
+                    if ([string]::IsNullOrEmpty($resourceName)) { $resourceName = $entry.properties.name.value }
+                    if ([string]::IsNullOrEmpty($resourceName))  { $resourceName = $entry.name }
+                    if ([string]::IsNullOrEmpty($resourceName))  { continue }
+
+                    # shareableQuota field name varies by API version: try both spellings.
+                    $sqValue = $entry.properties.shareableQuota
+                    if ($null -eq $sqValue) { $sqValue = $entry.properties.sharableQuota }
+
+                    if ($null -ne $sqValue) {
+                        $subShareable[$resourceName] = [int]$sqValue
                     }
                 }
                 $g.SubscriptionAllocations[$subId.ToLower()] = $subShareable
