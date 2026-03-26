@@ -64,7 +64,7 @@
       - Reader access to the Management Group (when using -ManagementGroup)
       - Management Group Reader access for Quota Group discovery
 
-    Output file: ./output/QuotaReport_{region}_{yyyyMMdd}.md
+    Output file: ./output/QuotaReport_{region}_{yyyyMMdd}.md (default), or ./output/{OutputFileName}.md if -OutputFileName is supplied.
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'BySubscription')]
@@ -83,7 +83,10 @@ param (
     [Parameter(Mandatory = $true, HelpMessage = "Single Azure region to analyze (e.g. 'eastus')")]
     [ValidateNotNullOrEmpty()]
     [ValidatePattern('^[a-z0-9]+$', ErrorMessage = "Region must be a lowercase Azure region name (e.g. 'eastus', 'uksouth').")]
-    [string]$Region
+    [string]$Region,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Optional base name for the output file (no extension). Defaults to 'QuotaReport_{region}_{yyyyMMdd}'. The .md extension is always appended.")]
+    [string]$OutputFileName
 )
 
 # ================================================================================
@@ -1038,7 +1041,7 @@ function New-MarkdownReport {
                         $subName = $subInfo.SubscriptionName
                     } else {
                         $resolvedName = $SubNameLookup[$sid.ToLower()]
-                        $subName = if ($resolvedName) { "$resolvedName (``$sid``) *(not analyzed)*" } else { "``$sid`` *(not analyzed)*" }
+                        $subName = if ($resolvedName) { "$resolvedName *(not analyzed)*" } else { "``$sid`` *(not analyzed)*" }
                     }
                     $quotaRow   = $analyzedResults | Where-Object { $_.SubscriptionId -ieq $sid -and $_.Family -eq $family } | Select-Object -First 1
 
@@ -1269,7 +1272,7 @@ try {
 }
 
 $timestamp      = $scriptStart.ToString("yyyyMMdd")
-$reportFileName = "QuotaReport_${Region}_${timestamp}.md"
+$reportFileName = if ($OutputFileName) { "$($OutputFileName.Trim()).md" } else { "QuotaReport_${Region}_${timestamp}.md" }
 $reportPath     = Join-Path $outputDir $reportFileName
 
 $resourceManagerUrl = $azContext.Environment.ResourceManagerUrl
