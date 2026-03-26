@@ -38,10 +38,6 @@
     The Azure region to analyze (e.g. 'eastus', 'westeurope'). Only one region is
     supported per run to keep the report focused.
 
-.PARAMETER Threads
-    Number of parallel threads for processing subscriptions. Default is 4.
-    Set to 0 for auto-detection based on CPU count. Maximum is 40.
-
 .EXAMPLE
     .\Get-AzQuotaUsageReport.ps1 -ManagementGroup "MyMG" -CpuFamilies "standardDSv5Family" -Region "eastus"
 
@@ -61,8 +57,8 @@
 
 .NOTES
     Requirements:
-      - PowerShell 7.0 or later (ForEach-Object -Parallel support)
-      - Az.Accounts, Az.Compute, Az.Resources modules
+      - PowerShell 7.0 or later
+      - Az.Accounts, Az.Compute, Az.Resources, Az.ResourceGraph modules
       - Reader access to all target subscriptions
       - Reader access to the Management Group (when using -ManagementGroup)
 
@@ -83,11 +79,7 @@ param (
     [object[]]$CpuFamilies,
 
     [Parameter(Mandatory = $true, HelpMessage = "Single Azure region to analyze (e.g. 'eastus')")]
-    [string]$Region,
-
-    [Parameter(Mandatory = $false, HelpMessage = "Parallel threads (0 = auto-detect, max 40)")]
-    [ValidateRange(0, 40)]
-    [int]$Threads = 4
+    [string]$Region
 )
 
 # ================================================================================
@@ -764,12 +756,6 @@ if ($null -eq $azContext -or $null -eq $azContext.Account) {
 }
 Write-Host "Using Azure context: $($azContext.Account.Id) (Tenant: $($azContext.Tenant.TenantId))"
 
-# ── Auto-detect thread count ─────────────────────────────────────────────────────
-if ($Threads -eq 0) {
-    $Threads = [System.Environment]::ProcessorCount
-    Write-Host "Auto-detected thread count: $Threads"
-}
-
 # ── Resolve subscriptions ───────────────────────────────────────────────────────
 Write-Host "`nResolving subscriptions..."
 $mgInput  = if ($PSCmdlet.ParameterSetName -eq 'ByManagementGroup') { @($ManagementGroup) } else { @() }
@@ -802,32 +788,25 @@ $timestamp      = $scriptStart.ToString("yyyyMMdd")
 $reportFileName = "QuotaReport_${Region}_${timestamp}.md"
 $reportPath     = Join-Path $outputDir $reportFileName
 
-# ── Capture resource manager URL before entering parallel scope ─────────────────
 $resourceManagerUrl = $azContext.Environment.ResourceManagerUrl
 
-Write-Host "`nQuerying $($resolvedSubscriptionIds.Count) subscription(s) across $($resolvedFamilies.Count) family/families in $Region using $Threads thread(s)..."
+Write-Host "`nQuerying $($resolvedSubscriptionIds.Count) subscription(s) across $($resolvedFamilies.Count) family/families in $Region..."
 Write-Host "This may take a few minutes for large subscription sets.`n"
 
-# ── Run parallel quota data collection ─────────────────────────────────────────
-# Capture function definitions as strings for re-injection into parallel runspaces
-$funcGetQuotaFromApi          = ${function:Get-QuotaFromApi}.ToString()
-$funcGetZonePeers             = ${function:Get-ZonePeers}.ToString()
-$funcGetSubscriptionQuotaData = ${function:Get-SubscriptionQuotaData}.ToString()
-
-$allResults = @(
-    $resolvedSubscriptionIds | ForEach-Object -ThrottleLimit $Threads -Parallel {
-        # Re-inject helper functions into this runspace
-        ${function:Get-QuotaFromApi}          = $using:funcGetQuotaFromApi
-        ${function:Get-ZonePeers}             = $using:funcGetZonePeers
-        ${function:Get-SubscriptionQuotaData} = $using:funcGetSubscriptionQuotaData
-
-        Get-SubscriptionQuotaData `
-            -SubscriptionId     $_ `
-            -Region             $using:Region `
-            -CpuFamilies        $using:resolvedFamilies `
-            -ResourceManagerUrl $using:resourceManagerUrl
-    }
-)
+# ── Sequential quota data collection ───────────────────────────────────────────
+# Sequential execution ensures each subscription's Az context is fully set before
+# any cmdlets run. Cmdlets such as Get-AzComputeResourceSku and Get-AzVMUsage have
+# no -SubscriptionId parameter and rely on the current context — parallelization
+# caused race conditions where the wrong subscription's data was returned.
+$allResults = [System.Collections.Generic.List[object]]::new()
+foreach ($subId in $resolvedSubscriptionIds) {
+    $subResults = Get-SubscriptionQuotaData `
+        -SubscriptionId     $subId `
+        -Region             $Region `
+        -CpuFamilies        $resolvedFamilies `
+        -ResourceManagerUrl $resourceManagerUrl
+    foreach ($r in $subResults) { $allResults.Add($r) }
+}
 
 if ($allResults.Count -eq 0) {
     Write-Warning "No quota data was collected. Verify the region name and that subscriptions are accessible."
