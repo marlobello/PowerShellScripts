@@ -258,9 +258,6 @@ function Resolve-CpuFamilies {
 .PARAMETER Region
     The Azure region to query (e.g. 'eastus').
 
-.PARAMETER ResourceManagerUrl
-    Base URL of the Azure Resource Manager endpoint for the current cloud.
-
 .OUTPUTS
     Array of PSCustomObjects with Value, LocalizedValue, CurrentValue, and Limit.
     Returns empty array on failure or when the subscription has no compute quota.
@@ -268,8 +265,7 @@ function Resolve-CpuFamilies {
 function Get-QuotaFromModule {
     param (
         [string]$SubscriptionId,
-        [string]$Region,
-        [string]$ResourceManagerUrl
+        [string]$Region
     )
 
     try {
@@ -304,6 +300,7 @@ function Get-QuotaFromModule {
 
         return @($result)
     } catch {
+        Write-Warning "Get-QuotaFromModule failed for subscription $SubscriptionId in $Region`: $($_.Exception.Message)"
         return @()
     }
 }
@@ -349,7 +346,7 @@ function Get-ZonePeers {
         $response = Invoke-AzRest -Method GET -Uri $uri -ErrorAction Stop
         $locations = ($response.Content | ConvertFrom-Json).value
 
-        $regionEntry  = $locations | Where-Object { $_.name -eq $Region -and $_.type -eq "Region" }
+        $regionEntry  = $locations | Where-Object { $_.name -ieq $Region -and $_.type -eq "Region" } | Select-Object -First 1
         $zoneMappings = $regionEntry.availabilityZoneMappings
 
         if (-not $zoneMappings) {
@@ -495,8 +492,9 @@ function Get-QuotaGroupMembership {
 
 .OUTPUTS
     Array of PSCustomObjects, one per unique group, with properties:
-    ManagementGroup, GroupName, GroupDisplayName, GroupType, MemberSubIds (List),
-    GroupLimits (array or null), GroupAllocations (array or null).
+    ManagementGroup, GroupName, GroupDisplayName, GroupType, MemberSubIds (HashSet),
+    GroupLimits (array or null), GroupAllocations (array or null),
+    SubscriptionAllocations (hashtable: subId.ToLower() -> raw allocation objects array).
 #>
 function Get-QuotaGroupDetails {
     param (
@@ -547,10 +545,6 @@ function Get-QuotaGroupDetails {
         # GET {rm}providers/Microsoft.Management/managementGroups/{mg}/subscriptions/{subId}/
         #        providers/Microsoft.Quota/groupQuotas/{group}/resourceProviders/
         #        Microsoft.Compute/quotaAllocations/{region}?api-version=2025-03-01
-        # Fetch per-subscription shareableQuota using the correct group-context endpoint:
-        # GET {rm}providers/Microsoft.Management/managementGroups/{mg}/subscriptions/{subId}/
-        #        providers/Microsoft.Quota/groupQuotas/{group}/resourceProviders/
-        #        Microsoft.Compute/quotaAllocations/{region}?api-version=2025-03-01
         # Store raw objects so the report can do flexible name matching (field names vary).
         foreach ($subId in $g.MemberSubIds) {
             $subAllocUri  = "{0}providers/Microsoft.Management/managementGroups/{1}/subscriptions/{2}/providers/Microsoft.Quota/groupQuotas/{3}/resourceProviders/Microsoft.Compute/quotaAllocations/{4}?api-version=2025-03-01" -f $ResourceManagerUrl, $g.ManagementGroup, $subId, $g.GroupName, $Region
@@ -577,18 +571,18 @@ function Get-QuotaGroupDetails {
     Collects quota usage and availability zone data for a single subscription.
 
 .DESCRIPTION
-    Core per-subscription analysis function, designed to run in parallel across
-    multiple subscriptions. For the target subscription and region, this function:
+    Core per-subscription analysis function. For the target subscription and region,
+    this function:
 
       1. Sets the Az context to the subscription
-      2. Retrieves logical-to-physical availability zone mappings
-      3. Gets compute resource SKUs (filtered to virtualMachines and requested families)
-      4. Gets current VM quota usage via the Az.Quota module (Get-AzVMUsage as fallback)
-      5. Joins SKU data to quota data by CPU family
-      6. Returns structured objects per family, each containing:
-           - Subscription metadata (TenantId, Id, Name)
-           - Family quota totals (CoresUsed, CoresLimit, UtilizationPct)
-           - Per-SKU detail (zones, restrictions) as a nested array
+      2. Checks that Microsoft.Compute is registered (skips if not)
+      3. Warns if Microsoft.Quota is not registered (continues with fallback)
+      4. Retrieves logical-to-physical availability zone mappings
+      5. Gets compute resource SKUs (filtered to virtualMachines)
+      6. Gets VM instance counts from Azure Resource Graph
+      7. Gets current VM quota via the Az.Quota module (Get-AzVMUsage as fallback)
+      8. Joins SKU data to quota data by CPU family
+      9. Returns structured objects per family with quota totals and per-SKU detail
 
 .PARAMETER SubscriptionId
     The Azure subscription ID to analyze.
@@ -669,8 +663,12 @@ function Get-SubscriptionQuotaData {
 
         # Get all VM SKUs in this region (unfiltered — we filter per-family below once
         # canonical API names are resolved from the usage data)
-        $allComputeSkus = Get-AzComputeResourceSku -Location $Region -ErrorAction SilentlyContinue |
-            Where-Object { $_.ResourceType -eq 'virtualMachines' }
+        $allComputeSkus = @(Get-AzComputeResourceSku -Location $Region -ErrorAction SilentlyContinue |
+            Where-Object { $_.ResourceType -eq 'virtualMachines' })
+
+        if ($allComputeSkus.Count -eq 0) {
+            Write-Warning "No virtualMachine SKUs returned for region '$Region' in subscription '$($subscription.Name)'. Zone and SKU data will be missing."
+        }
 
         # Build a VM instance count lookup: vmSize (lowercase) -> count of deployed VMs in this region.
         # Uses Azure Resource Graph for a single efficient API call with server-side aggregation,
@@ -690,11 +688,13 @@ resources
         }
 
         # Primary quota source: Az.Quota module (Get-AzQuota for limits + Get-AzQuotaUsage for usage)
-        $quotaApiResults = Get-QuotaFromModule -SubscriptionId $SubscriptionId -Region $Region -ResourceManagerUrl $ResourceManagerUrl
+        $quotaApiResults = Get-QuotaFromModule -SubscriptionId $SubscriptionId -Region $Region
 
         # Fallback quota source: classic Compute usage API (Get-AzVMUsage)
         # Used when the Az.Quota module returns no data (e.g. provider not registered or transient failure)
         $vmUsageExpanded = if ($quotaApiResults.Count -eq 0) {
+            # -ExpandProperty Name expands PSUsageName into Value+LocalizedValue on the output object.
+            # -Property CurrentValue,Limit adds those fields alongside. Result shape matches quotaApiResults.
             Get-AzVMUsage -Location $Region -ErrorAction SilentlyContinue |
                 Select-Object -ExpandProperty Name -Property CurrentValue, Limit
         } else { @() }
@@ -711,11 +711,13 @@ resources
             # Match against BOTH the API key (Value) and the display name (LocalizedValue).
             # Try the Quota API first, then fall back to the classic Get-AzVMUsage data.
             $familyUsage = $quotaApiResults |
-                Where-Object { $_.Value -eq $family -or $_.LocalizedValue -eq $family }
+                Where-Object { $_.Value -eq $family -or $_.LocalizedValue -eq $family } |
+                Select-Object -First 1
 
             if (-not $familyUsage -and $vmUsageExpanded.Count -gt 0) {
                 $familyUsage = $vmUsageExpanded |
-                    Where-Object { $_.Value -eq $family -or $_.LocalizedValue -eq $family }
+                    Where-Object { $_.Value -eq $family -or $_.LocalizedValue -eq $family } |
+                    Select-Object -First 1
             }
 
             # Resolve the canonical API-key name to use for SKU filtering
@@ -1065,10 +1067,10 @@ function New-MarkdownReport {
         $md.Add("### $($sub.SubscriptionName) - ``$($sub.SubscriptionId)``$groupBadge")
         $md.Add("")
 
-        $subResults = @($Results | Where-Object { $_.SubscriptionId -eq $sub.SubscriptionId })
+        $subResults = @($Results | Where-Object { $_.SubscriptionId -ieq $sub.SubscriptionId })
 
         foreach ($family in $CpuFamilies) {
-            $familyResult = $subResults | Where-Object { $_.Family -eq $family }
+            $familyResult = $subResults | Where-Object { $_.Family -eq $family } | Select-Object -First 1
 
             if (-not $familyResult) {
                 $md.Add("#### $family")
@@ -1143,7 +1145,7 @@ if (-not (Get-Module -Name Az.Quota -ListAvailable)) {
         throw "Az.Quota module is required. Install it with: Install-Module -Name Az.Quota -Scope CurrentUser"
     }
 }
-Import-Module Az.Quota -ErrorAction SilentlyContinue
+Import-Module Az.Quota -ErrorAction Stop
 
 # ── Resolve subscriptions ───────────────────────────────────────────────────────
 Write-Host "`nResolving subscriptions..."
