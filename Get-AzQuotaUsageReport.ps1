@@ -504,9 +504,12 @@ function Get-QuotaGroupMembership {
 
 .OUTPUTS
     Array of PSCustomObjects, one per unique group, with properties:
-    ManagementGroup, GroupName, GroupDisplayName, GroupType, MemberSubIds (HashSet),
+    ManagementGroup, GroupName, GroupDisplayName, GroupType,
+    MemberSubIds (HashSet — only the user-analyzed subscriptions in this group),
+    AllMemberSubIds (HashSet — every subscription in the group, regardless of scope),
     GroupLimits (array or null), GroupAllocations (array or null),
-    SubscriptionAllocations (hashtable: subId.ToLower() -> raw allocation objects array).
+    SubscriptionAllocations (hashtable: subId.ToLower() -> raw allocation objects array
+    for ALL group members, enabling accurate net-available totals in the report).
 #>
 function Get-QuotaGroupDetails {
     param (
@@ -522,14 +525,15 @@ function Get-QuotaGroupDetails {
             $key = "$($grp.ManagementGroup)|$($grp.GroupName)"
             if (-not $groups.ContainsKey($key)) {
                 $groups[$key] = [PSCustomObject]@{
-                    ManagementGroup        = $grp.ManagementGroup
-                    GroupName              = $grp.GroupName
-                    GroupDisplayName       = $grp.GroupDisplayName
-                    GroupType              = $grp.GroupType
-                    MemberSubIds           = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                    GroupLimits            = $null
-                    GroupAllocations       = $null
-                    SubscriptionAllocations = @{}   # subId.ToLower() -> array of raw allocation objects from quotaAllocations API
+                    ManagementGroup         = $grp.ManagementGroup
+                    GroupName               = $grp.GroupName
+                    GroupDisplayName        = $grp.GroupDisplayName
+                    GroupType               = $grp.GroupType
+                    MemberSubIds            = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)  # user-analyzed subs only
+                    AllMemberSubIds         = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)  # all subs in the group
+                    GroupLimits             = $null
+                    GroupAllocations        = $null
+                    SubscriptionAllocations = @{}   # subId.ToLower() -> raw allocation objects (populated for ALL members)
                 }
             }
             $groups[$key].MemberSubIds.Add($subId) | Out-Null
@@ -542,6 +546,22 @@ function Get-QuotaGroupDetails {
     foreach ($key in $groups.Keys) {
         $g    = $groups[$key]
         $base = "{0}providers/Microsoft.Management/managementGroups/{1}/providers/Microsoft.Quota/groupQuotas/{2}/resourceProviders/Microsoft.Compute/locations/{3}" -f $ResourceManagerUrl, $g.ManagementGroup, $g.GroupName, $Region
+
+        # Fetch the complete member subscription list for this group — the user may have
+        # only provided a subset of its subscriptions, but we need all of them to compute
+        # an accurate net shareableQuota total across the whole group.
+        $allMembersUri  = "{0}providers/Microsoft.Management/managementGroups/{1}/providers/Microsoft.Quota/groupQuotas/{2}/subscriptions?api-version=2023-06-01-preview" -f $ResourceManagerUrl, $g.ManagementGroup, $g.GroupName
+        $allMembersResp = Invoke-AzRest -Method GET -Uri $allMembersUri -ErrorAction SilentlyContinue
+        if ($allMembersResp -and $allMembersResp.StatusCode -eq 200) {
+            $allMembers = try { ($allMembersResp.Content | ConvertFrom-Json).value } catch { @() }
+            foreach ($member in $allMembers) {
+                if (-not [string]::IsNullOrEmpty($member.name)) {
+                    $g.AllMemberSubIds.Add($member.name) | Out-Null
+                }
+            }
+        }
+        # Ensure every user-analyzed subscription is included even if the API call failed
+        foreach ($sid in $g.MemberSubIds) { $g.AllMemberSubIds.Add($sid) | Out-Null }
 
         $limResp = Invoke-AzRest -Method GET -Uri "$base/groupQuotaLimits?api-version=2023-06-01-preview" -ErrorAction SilentlyContinue
         if ($limResp -and $limResp.StatusCode -eq 200) {
@@ -559,12 +579,9 @@ function Get-QuotaGroupDetails {
             }
         }
 
-        # Fetch per-subscription shareableQuota using the correct group-context endpoint:
-        # GET {rm}providers/Microsoft.Management/managementGroups/{mg}/subscriptions/{subId}/
-        #        providers/Microsoft.Quota/groupQuotas/{group}/resourceProviders/
-        #        Microsoft.Compute/quotaAllocations/{region}?api-version=2025-03-01
-        # Store raw objects so the report can do flexible name matching (field names vary).
-        foreach ($subId in $g.MemberSubIds) {
+        # Fetch shareableQuota for ALL group members (not just user-analyzed ones) so the
+        # net total row in the report reflects the true group-wide quota position.
+        foreach ($subId in $g.AllMemberSubIds) {
             $subAllocUri  = "{0}providers/Microsoft.Management/managementGroups/{1}/subscriptions/{2}/providers/Microsoft.Quota/groupQuotas/{3}/resourceProviders/Microsoft.Compute/quotaAllocations/{4}?api-version=2025-03-01" -f $ResourceManagerUrl, $g.ManagementGroup, $subId, $g.GroupName, $Region
             Write-Verbose "  [ShareableQuota] GET $subAllocUri"
             $subAllocResp = Invoke-AzRest -Method GET -Uri $subAllocUri -ErrorAction SilentlyContinue
@@ -981,8 +998,6 @@ function New-MarkdownReport {
 
                     $totalUsed      = 0
                     $totalLimit     = 0
-                    $totalShareable = $null
-                    $anyShareable   = $false
 
                     foreach ($row in ($familyRows | Sort-Object SubscriptionName)) {
                         $utilDisplay  = if ($row.UtilizationPct -gt 80) { "⚠️ $($row.UtilizationPct)%" } else { "$($row.UtilizationPct)%" }
@@ -1017,15 +1032,34 @@ function New-MarkdownReport {
 
                         $totalUsed  += $row.CoresUsed
                         $totalLimit += $row.CoresLimit
-                        if ($null -ne $shareableQuota) {
-                            $totalShareable = ($null -eq $totalShareable) ? $shareableQuota : ($totalShareable + $shareableQuota)
-                            $anyShareable   = $true
-                        }
                     }
 
                     $totalUtil        = if ($totalLimit -gt 0) { [math]::Round(($totalUsed / $totalLimit) * 100, 1) } else { 0 }
                     $totalUtilDisplay = if ($totalUtil -gt 80) { "⚠️ $totalUtil%" } else { "$totalUtil%" }
-                    $totalShareDisplay= if ($anyShareable) { "$([Math]::Abs($totalShareable)) available in QG" } else { "—" }
+
+                    # Compute net shareableQuota across ALL group members (not just analyzed ones)
+                    # so the "available in QG" total reflects the true group-wide position.
+                    $netShareable    = $null
+                    $anyShareableAll = $false
+                    foreach ($allSubId in $grp.AllMemberSubIds) {
+                        if (-not $grp.SubscriptionAllocations.ContainsKey($allSubId.ToLower())) { continue }
+                        $allEntries = $grp.SubscriptionAllocations[$allSubId.ToLower()]
+                        $allMatch = $allEntries | Where-Object {
+                            $_.name                           -eq $family -or
+                            $_.properties.resourceName        -eq $family -or
+                            $_.properties.name.value          -eq $family -or
+                            $_.properties.name.localizedValue -eq $displayName
+                        } | Select-Object -First 1
+                        if ($allMatch) {
+                            $sqVal = $allMatch.properties.shareableQuota
+                            if ($null -eq $sqVal) { $sqVal = $allMatch.properties.sharableQuota }
+                            if ($null -ne $sqVal) {
+                                $netShareable    = ($null -eq $netShareable) ? [int]$sqVal : ($netShareable + [int]$sqVal)
+                                $anyShareableAll = $true
+                            }
+                        }
+                    }
+                    $totalShareDisplay = if ($anyShareableAll) { "$([Math]::Abs($netShareable)) available in QG" } else { "—" }
                     $md.Add("| **Total** | **$totalUsed** | **$totalLimit** | **$totalUtilDisplay** | **$totalShareDisplay** |")
                     $md.Add("")
                 }
