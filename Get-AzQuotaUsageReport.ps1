@@ -437,17 +437,25 @@ function Get-SubscriptionQuotaData {
 
         # ── Resource provider registration check ────────────────────────────────
         # Microsoft.Compute must be registered — without it no quota, SKU, or zone
-        # data is available. Get-AzResourceProvider returns one row per resource type
-        # so we take the first row's RegistrationState as the provider-level answer.
-        # Microsoft.Quota is NOT checked here: the provider can be listed as
-        # "NotRegistered" yet the Quota API still responds (it is a platform-level
-        # endpoint, not a per-subscription resource deployment). The existing fallback
-        # to Get-AzVMUsage handles any case where the Quota API does not respond.
-        $computeProvider = Get-AzResourceProvider -ProviderNamespace Microsoft.Compute `
-            -ErrorAction SilentlyContinue | Select-Object -First 1
+        # data is available for the subscription.
+        #
+        # IMPORTANT: Get-AzResourceProvider has no -SubscriptionId parameter and
+        # relies solely on the current Az context. In a parallel runspace another
+        # thread can switch that context between Set-AzContext and the cmdlet call,
+        # silently checking the wrong subscription. We use Invoke-AzRest instead —
+        # the subscription ID is embedded directly in the URL and is context-independent.
+        #
+        # Microsoft.Quota is NOT checked: it reports NotRegistered even when the
+        # Quota REST API responds correctly (platform-level endpoint). The existing
+        # fallback to Get-AzVMUsage handles any case where the Quota API is unavailable.
+        $providerUri   = "{0}subscriptions/{1}/providers/Microsoft.Compute?api-version=2021-04-01" -f $ResourceManagerUrl, $SubscriptionId
+        $providerResp  = Invoke-AzRest -Method GET -Uri $providerUri -ErrorAction SilentlyContinue
+        $providerState = if ($providerResp -and $providerResp.StatusCode -eq 200) {
+            ($providerResp.Content | ConvertFrom-Json).registrationState
+        } else { $null }
 
-        if ($computeProvider.RegistrationState -ne 'Registered') {
-            $state = if ($computeProvider) { $computeProvider.RegistrationState } else { 'unknown' }
+        if ($providerState -ne 'Registered') {
+            $state = if ($providerState) { $providerState } else { 'unknown' }
             Write-Warning "Skipping subscription '$($subscription.Name)': Microsoft.Compute is not registered (state: '$state'). Register it with: Register-AzResourceProvider -ProviderNamespace Microsoft.Compute"
             return @()
         }
