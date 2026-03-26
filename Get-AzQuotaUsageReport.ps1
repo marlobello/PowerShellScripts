@@ -461,6 +461,84 @@ function Get-QuotaGroupMembership {
 
 <#
 .SYNOPSIS
+    Enriches Quota Group membership data with group-level quota limits and allocations.
+
+.DESCRIPTION
+    Takes the membership hashtable from Get-QuotaGroupMembership and builds a
+    deduplicated list of unique groups (one object per ManagementGroup+GroupName pair).
+    For each group, attempts to fetch group-level quota limits and per-subscription
+    quota allocations from the Microsoft.Quota GroupQuotas preview API.
+
+    Both sub-resources are in preview and may return 400/404 if limits have not been
+    configured for the group. In that case the GroupLimits and GroupAllocations fields
+    are left null and the report renders an informational note.
+
+.PARAMETER GroupMembership
+    Hashtable from Get-QuotaGroupMembership: subscriptionId (lowercase) ->
+    List of group membership objects (ManagementGroup, GroupName, GroupDisplayName,
+    GroupType, ProvisioningState).
+
+.PARAMETER Region
+    The Azure region to query group quota limits for (e.g. 'uksouth').
+
+.PARAMETER ResourceManagerUrl
+    Base URL of the Azure Resource Manager endpoint for the current cloud.
+
+.OUTPUTS
+    Array of PSCustomObjects, one per unique group, with properties:
+    ManagementGroup, GroupName, GroupDisplayName, GroupType, MemberSubIds (List),
+    GroupLimits (array or null), GroupAllocations (array or null).
+#>
+function Get-QuotaGroupDetails {
+    param (
+        [hashtable]$GroupMembership,
+        [string]$Region,
+        [string]$ResourceManagerUrl
+    )
+
+    # Build deduplicated group objects from the flat membership hashtable
+    $groups = @{}
+    foreach ($subId in $GroupMembership.Keys) {
+        foreach ($grp in $GroupMembership[$subId]) {
+            $key = "$($grp.ManagementGroup)|$($grp.GroupName)"
+            if (-not $groups.ContainsKey($key)) {
+                $groups[$key] = [PSCustomObject]@{
+                    ManagementGroup  = $grp.ManagementGroup
+                    GroupName        = $grp.GroupName
+                    GroupDisplayName = $grp.GroupDisplayName
+                    GroupType        = $grp.GroupType
+                    MemberSubIds     = [System.Collections.Generic.List[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    GroupLimits      = $null
+                    GroupAllocations = $null
+                }
+            }
+            if (-not $groups[$key].MemberSubIds.Contains($subId)) {
+                $groups[$key].MemberSubIds.Add($subId)
+            }
+        }
+    }
+
+    # Enrich each group with quota limits and allocations from the GroupQuotas API
+    foreach ($key in $groups.Keys) {
+        $g    = $groups[$key]
+        $base = "{0}providers/Microsoft.Management/managementGroups/{1}/providers/Microsoft.Quota/groupQuotas/{2}/resourceProviders/Microsoft.Compute/locations/{3}" -f $ResourceManagerUrl, $g.ManagementGroup, $g.GroupName, $Region
+
+        $limResp = Invoke-AzRest -Method GET -Uri "$base/groupQuotaLimits?api-version=2023-06-01-preview" -ErrorAction SilentlyContinue
+        if ($limResp -and $limResp.StatusCode -eq 200) {
+            $g.GroupLimits = try { ($limResp.Content | ConvertFrom-Json).value } catch { @() }
+        }
+
+        $allocResp = Invoke-AzRest -Method GET -Uri "$base/quotaAllocations?api-version=2023-06-01-preview" -ErrorAction SilentlyContinue
+        if ($allocResp -and $allocResp.StatusCode -eq 200) {
+            $g.GroupAllocations = try { ($allocResp.Content | ConvertFrom-Json).value } catch { @() }
+        }
+    }
+
+    return @($groups.Values)
+}
+
+<#
+.SYNOPSIS
     Collects quota usage and availability zone data for a single subscription.
 
 .DESCRIPTION
@@ -706,10 +784,11 @@ resources
 .PARAMETER GeneratedAt
     The datetime the report was generated (used in the header).
 
-.PARAMETER QuotaGroupMembership
-    Hashtable of quota group membership data, keyed by (lowercase) subscription ID,
-    as returned by Get-QuotaGroupMembership. Used to populate the Quota Group
-    Membership section and annotate per-subscription headings.
+.PARAMETER GroupDetails
+    Array of enriched group objects as returned by Get-QuotaGroupDetails. Each object
+    has ManagementGroup, GroupName, GroupDisplayName, GroupType, MemberSubIds,
+    GroupLimits, and GroupAllocations. Used to populate the Quota Group Membership
+    section and annotate per-subscription headings. Pass an empty array if none.
 
 .OUTPUTS
     A single string containing the complete Markdown document.
@@ -720,24 +799,27 @@ function New-MarkdownReport {
         [string]$Region,
         [string[]]$CpuFamilies,
         [datetime]$GeneratedAt,
-        [hashtable]$QuotaGroupMembership = @{}
+        [object[]]$GroupDetails = @()
     )
 
     $md = [System.Collections.Generic.List[string]]::new()
 
-    # Pre-compute subscription list and group lookups used across multiple sections
+    # Pre-compute subscription list used across multiple sections
     $uniqueSubs = $Results |
         Group-Object -Property SubscriptionId |
         ForEach-Object { $_.Group[0] } |
         Select-Object SubscriptionId, SubscriptionName |
         Sort-Object SubscriptionName
 
-    $allGroups = @{}
-    if ($QuotaGroupMembership) {
-        foreach ($subGroups in $QuotaGroupMembership.Values) {
-            foreach ($g in $subGroups) {
-                $allGroups["$($g.ManagementGroup)/$($g.GroupName)"] = $g
+    # Build reverse lookup for per-subscription heading badges: subId -> [display names]
+    $subToGroupNames = @{}
+    foreach ($grp in $GroupDetails) {
+        $displayName = if ($grp.GroupDisplayName -and $grp.GroupDisplayName -ne $grp.GroupName) { $grp.GroupDisplayName } else { $grp.GroupName }
+        foreach ($sid in $grp.MemberSubIds) {
+            if (-not $subToGroupNames.ContainsKey($sid)) {
+                $subToGroupNames[$sid] = [System.Collections.Generic.List[string]]::new()
             }
+            $subToGroupNames[$sid].Add($displayName)
         }
     }
 
@@ -750,7 +832,7 @@ function New-MarkdownReport {
     $md.Add("| **Region** | ``$Region`` |")
     $md.Add("| **CPU Families** | $($CpuFamilies -join ', ') |")
     $md.Add("| **Subscriptions Analyzed** | $($uniqueSubs.Count) |")
-    $md.Add("| **Quota Groups Found** | $($allGroups.Count) |")
+    $md.Add("| **Quota Groups Found** | $($GroupDetails.Count) |")
     $md.Add("")
 
     $md.Add("### Subscriptions Queried")
@@ -799,38 +881,119 @@ function New-MarkdownReport {
     $md.Add("## Quota Group Membership")
     $md.Add("")
 
-    if ($allGroups.Count -eq 0) {
+    if (-not $GroupDetails -or $GroupDetails.Count -eq 0) {
         $md.Add("No Quota Group memberships were found for the analyzed subscriptions.")
         $md.Add("")
         $md.Add("> Consider creating an [Azure Quota Group](https://learn.microsoft.com/azure/quotas/quota-groups) to share quota across subscriptions and reduce the need for individual quota increase requests.")
-    } else {
-        $md.Add("Subscriptions that are members of an Azure Quota Group share a common quota pool, reducing the need to request increases per subscription.")
         $md.Add("")
-        $md.Add("| Subscription | Group Name | Group Display Name | Management Group | Group Type |")
-        $md.Add("|---|---|---|---|---|")
+        $md.Add("---")
+        $md.Add("")
+    } else {
+        $groupedSubIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($grp in $GroupDetails) {
+            foreach ($sid in $grp.MemberSubIds) { $groupedSubIds.Add($sid) | Out-Null }
+        }
+        $md.Add("$($GroupDetails.Count) Quota Group(s) found covering $($groupedSubIds.Count) of $($uniqueSubs.Count) analyzed subscription(s).")
+        $md.Add("")
 
-        $groupedSubs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($grp in ($GroupDetails | Sort-Object GroupDisplayName)) {
+            $heading = if ($grp.GroupDisplayName -and $grp.GroupDisplayName -ne $grp.GroupName) { $grp.GroupDisplayName } else { $grp.GroupName }
+            $md.Add("### $heading — $($grp.ManagementGroup)")
+            $md.Add("")
+            $md.Add("| | |")
+            $md.Add("|---|---|")
+            $md.Add("| **Group Name** | ``$($grp.GroupName)`` |")
+            $md.Add("| **Group Type** | $($grp.GroupType) |")
 
-        foreach ($sub in $uniqueSubs) {
-            $subKey    = $sub.SubscriptionId.ToLower()
-            $subGroups = if ($QuotaGroupMembership.ContainsKey($subKey)) { @($QuotaGroupMembership[$subKey]) } else { @() }
-            foreach ($grp in $subGroups) {
-                $md.Add("| $($sub.SubscriptionName) (``$($sub.SubscriptionId)``) | $($grp.GroupName) | $($grp.GroupDisplayName) | $($grp.ManagementGroup) | $($grp.GroupType) |")
-                $groupedSubs.Add($sub.SubscriptionId) | Out-Null
+            # List member subscriptions, resolving names from $uniqueSubs
+            $memberDisplays = foreach ($sid in $grp.MemberSubIds) {
+                $subInfo = $uniqueSubs | Where-Object { $_.SubscriptionId -ieq $sid } | Select-Object -First 1
+                if ($subInfo) { "$($subInfo.SubscriptionName) (``$($subInfo.SubscriptionId)``)" } else { "``$sid``" }
             }
+            $md.Add("| **Member Subscriptions** | $($memberDisplays -join ', ') |")
+            $md.Add("")
+
+            # ── Member Subscription Quota Summary ──────────────────────────────
+            # Derived from the per-subscription quota data already collected —
+            # shows how much quota the group's member subs are collectively using.
+            $memberResults = @($Results | Where-Object { $grp.MemberSubIds.Contains($_.SubscriptionId) })
+
+            $md.Add("**Member Subscription Quota Summary (``$Region``)**")
+            $md.Add("")
+
+            if ($memberResults.Count -gt 0) {
+                $md.Add("| CPU Family | Total Used (vCPUs) | Total Limit (vCPUs) | Utilization |")
+                $md.Add("|---|---:|---:|---:|")
+
+                foreach ($family in $CpuFamilies) {
+                    $familyRows = @($memberResults | Where-Object { $_.Family -eq $family })
+                    if ($familyRows.Count -eq 0) { continue }
+
+                    $totalUsed  = ($familyRows | Measure-Object CoresUsed  -Sum).Sum
+                    $totalLimit = ($familyRows | Measure-Object CoresLimit -Sum).Sum
+                    $utilPct    = if ($totalLimit -gt 0) { [math]::Round(($totalUsed / $totalLimit) * 100, 1) } else { 0 }
+                    $utilDisplay= if ($utilPct -gt 80) { "⚠️ $utilPct%" } else { "$utilPct%" }
+
+                    $displayName = ($familyRows | Where-Object { $_.FamilyDisplayName -ne $family } | Select-Object -First 1).FamilyDisplayName
+                    if ([string]::IsNullOrEmpty($displayName)) { $displayName = $family }
+
+                    $md.Add("| $displayName | $totalUsed | $totalLimit | $utilDisplay |")
+                }
+            } else {
+                $md.Add("_No quota data collected for member subscriptions._")
+            }
+            $md.Add("")
+
+            # ── Group-Level Quota Limits ────────────────────────────────────────
+            # Sourced from the GroupQuotas API (preview). If not configured, a
+            # note is shown. The API returns limits/allocations at the group level,
+            # independent of what individual subscriptions have been granted.
+            $md.Add("**Group-Level Quota Limits (``$Region``)**")
+            $md.Add("")
+
+            if ($null -ne $grp.GroupLimits -and @($grp.GroupLimits).Count -gt 0) {
+                # Resolve the family name from whichever property the API populates
+                $relevantLimits = @($grp.GroupLimits | Where-Object {
+                    $rName = if ($_.name)                          { $_.name } `
+                             elseif ($_.properties.resourceName)  { $_.properties.resourceName } `
+                             elseif ($_.properties.name.value)    { $_.properties.name.value } `
+                             else                                  { $null }
+                    $rName -and ($CpuFamilies -contains $rName)
+                })
+
+                if ($relevantLimits.Count -gt 0) {
+                    $md.Add("| CPU Family | Group Limit (vCPUs) | Available to Allocate |")
+                    $md.Add("|---|---:|---:|")
+                    foreach ($lim in $relevantLimits) {
+                        $rName     = if ($lim.name)                         { $lim.name } `
+                                     elseif ($lim.properties.resourceName) { $lim.properties.resourceName } `
+                                     else                                   { $lim.properties.name.value }
+                        $limitVal  = if ($lim.properties.limit.value)          { [int]$lim.properties.limit.value } `
+                                     elseif ($lim.limit)                       { [int]$lim.limit } else { 0 }
+                        $available = if ($null -ne $lim.properties.availableLimit) { [int]$lim.properties.availableLimit } `
+                                     else { $limitVal }
+                        $md.Add("| $rName | $limitVal | $available |")
+                    }
+                } else {
+                    $md.Add("_Group quota limits found but none match the analyzed CPU families._")
+                }
+            } else {
+                $md.Add("> ℹ️ Group quota limits have not been configured or could not be retrieved for this group.")
+                $md.Add("> To configure group quota, see: [Azure Quota Groups](https://learn.microsoft.com/azure/quotas/quota-groups)")
+            }
+
+            $md.Add("")
+            $md.Add("---")
+            $md.Add("")
         }
 
-        $noGroupSubs = @($uniqueSubs | Where-Object { -not $groupedSubs.Contains($_.SubscriptionId) })
-        if ($noGroupSubs.Count -gt 0) {
-            $noGroupNames = ($noGroupSubs | ForEach-Object { "**$($_.SubscriptionName)**" }) -join ", "
+        $ungroupedSubs = @($uniqueSubs | Where-Object { -not $groupedSubIds.Contains($_.SubscriptionId) })
+        if ($ungroupedSubs.Count -gt 0) {
+            $ungroupedNames = ($ungroupedSubs | ForEach-Object { "**$($_.SubscriptionName)**" }) -join ", "
+            $md.Add("> The following analyzed subscriptions are not members of any Quota Group: $ungroupedNames")
             $md.Add("")
-            $md.Add("> The following subscriptions are not members of any Quota Group: $noGroupNames")
         }
     }
-
-    $md.Add("")
-    $md.Add("---")
-    $md.Add("")
 
     # ── Per-Subscription Detail ─────────────────────────────────────────────────
     $md.Add("## Per-Subscription Detail")
@@ -838,10 +1001,8 @@ function New-MarkdownReport {
 
     foreach ($sub in $uniqueSubs) {
         $subKey        = $sub.SubscriptionId.ToLower()
-        $subGroupNames = if ($QuotaGroupMembership -and $QuotaGroupMembership.ContainsKey($subKey)) {
-            @($QuotaGroupMembership[$subKey] | Select-Object -ExpandProperty GroupName -Unique)
-        } else { @() }
-        $groupBadge = if ($subGroupNames.Count -gt 0) { " *(Quota Groups: $($subGroupNames -join ', '))*" } else { "" }
+        $subGroupNames = if ($subToGroupNames.ContainsKey($subKey)) { @($subToGroupNames[$subKey]) } else { @() }
+        $groupBadge    = if ($subGroupNames.Count -gt 0) { " *(Quota Groups: $($subGroupNames -join ', '))*" } else { "" }
 
         $md.Add("### $($sub.SubscriptionName) - ``$($sub.SubscriptionId)``$groupBadge")
         $md.Add("")
@@ -982,25 +1143,28 @@ if ($allResults.Count -eq 0) {
     Write-Warning "No quota data was collected. Verify the region name and that subscriptions are accessible."
 }
 
-# ── Discover Quota Group memberships ───────────────────────────────────────────
+# ── Discover Quota Group memberships and details ────────────────────────────────
 Write-Host "`nDiscovering Quota Group memberships..."
 $groupMembership = Get-QuotaGroupMembership `
     -SubscriptionIds    $resolvedSubscriptionIds `
     -ResourceManagerUrl $resourceManagerUrl
 
-$totalGroupsFound = 0
-foreach ($subGroups in $groupMembership.Values) { $totalGroupsFound += @($subGroups | Select-Object -ExpandProperty GroupName -Unique).Count }
-$distinctGroupCount = ($groupMembership.Values | ForEach-Object { $_ } | Select-Object ManagementGroup, GroupName -Unique).Count
-Write-Host "Quota Group memberships discovered: $distinctGroupCount group(s)"
+Write-Host "Fetching group quota details..."
+$groupDetails = Get-QuotaGroupDetails `
+    -GroupMembership    $groupMembership `
+    -Region             $Region `
+    -ResourceManagerUrl $resourceManagerUrl
+
+Write-Host "Quota Groups found: $($groupDetails.Count)"
 
 # ── Generate and write Markdown report ─────────────────────────────────────────
 Write-Host "`nGenerating Markdown report..."
 $markdownContent = New-MarkdownReport `
-    -Results              $allResults `
-    -Region               $Region `
-    -CpuFamilies          $resolvedFamilies `
-    -GeneratedAt          $scriptStart `
-    -QuotaGroupMembership $groupMembership
+    -Results      $allResults `
+    -Region       $Region `
+    -CpuFamilies  $resolvedFamilies `
+    -GeneratedAt  $scriptStart `
+    -GroupDetails $groupDetails
 
 $markdownContent | Out-File -FilePath $reportPath -Encoding UTF8 -Force
 
@@ -1011,5 +1175,6 @@ Write-Host ""
 Write-Host "Report written to: $reportPath" -ForegroundColor Green
 Write-Host "Subscriptions analyzed : $($resolvedSubscriptionIds.Count)"
 Write-Host "CPU families analyzed  : $($resolvedFamilies.Count)"
+Write-Host "Quota groups found     : $($groupDetails.Count)"
 Write-Host "Region                 : $Region"
 Write-Host "Total time             : $totalElapsed`s"
