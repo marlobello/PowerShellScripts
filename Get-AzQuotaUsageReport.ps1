@@ -953,8 +953,7 @@ function New-MarkdownReport {
         $md.Add("")
 
         foreach ($grp in ($GroupDetails | Sort-Object GroupDisplayName)) {
-            $heading = if ($grp.GroupDisplayName -and $grp.GroupDisplayName -ne $grp.GroupName) { $grp.GroupDisplayName } else { $grp.GroupName }
-            $md.Add("### $heading (``$($grp.GroupName)``) — $($grp.ManagementGroup)")
+            $md.Add("### Quota Group: ``$($grp.GroupDisplayName)`` — $($grp.ManagementGroup)")
             $md.Add("")
 
             $memberDisplays = foreach ($sid in $grp.MemberSubIds) {
@@ -1011,7 +1010,7 @@ function New-MarkdownReport {
                         }
                         $shareDisplay = if ($null -ne $shareableQuota) {
                             if ($shareableQuota -gt 0)     { "$shareableQuota (from QG)" }
-                            elseif ($shareableQuota -lt 0) { "$shareableQuota (given to QG)" }
+                            elseif ($shareableQuota -lt 0) { "$([Math]::Abs($shareableQuota)) (given to QG)" }
                             else                           { "0" }
                         } else { "—" }
                         $md.Add("| $($row.SubscriptionName) | $($row.CoresUsed) | $($row.CoresLimit) | $utilDisplay | $shareDisplay |")
@@ -1026,7 +1025,7 @@ function New-MarkdownReport {
 
                     $totalUtil        = if ($totalLimit -gt 0) { [math]::Round(($totalUsed / $totalLimit) * 100, 1) } else { 0 }
                     $totalUtilDisplay = if ($totalUtil -gt 80) { "⚠️ $totalUtil%" } else { "$totalUtil%" }
-                    $totalShareDisplay= if ($anyShareable) { "$totalShareable available in QG" } else { "—" }
+                    $totalShareDisplay= if ($anyShareable) { "$([Math]::Abs($totalShareable)) available in QG" } else { "—" }
                     $md.Add("| **Total** | **$totalUsed** | **$totalLimit** | **$totalUtilDisplay** | **$totalShareDisplay** |")
                     $md.Add("")
                 }
