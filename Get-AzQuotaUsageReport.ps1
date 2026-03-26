@@ -419,7 +419,12 @@ function Get-QuotaGroupMembership {
     if (-not $managementGroups) { return $membership }
 
     foreach ($mg in $managementGroups) {
-        $mgName        = $mg.Name
+        $mgName = $mg.Name
+
+        # NOTE: The GroupQuotas API is not yet exposed by the Az.Quota module (v0.1.3).
+        # Az.Quota only covers per-subscription quota (Get-AzQuota, Get-AzQuotaUsage).
+        # Invoke-AzRest is used here because no equivalent module cmdlet exists.
+        # When Az.Quota adds GroupQuota cmdlets these calls should be replaced.
         $groupQuotaUri = "{0}providers/Microsoft.Management/managementGroups/{1}/providers/Microsoft.Quota/groupQuotas?api-version=2023-06-01-preview" -f $ResourceManagerUrl, $mgName
         $groupResp     = Invoke-AzRest -Method GET -Uri $groupQuotaUri -ErrorAction SilentlyContinue
         if (-not $groupResp -or $groupResp.StatusCode -ne 200) { continue }
@@ -518,7 +523,9 @@ function Get-QuotaGroupDetails {
         }
     }
 
-    # Enrich each group with quota limits and allocations from the GroupQuotas API
+    # Enrich each group with quota limits and allocations from the GroupQuotas API.
+    # NOTE: Az.Quota v0.1.3 has no GroupQuota cmdlets (Get-AzQuotaGroupQuotaLimit etc.)
+    # are not yet published. Invoke-AzRest is the only available interface today.
     foreach ($key in $groups.Keys) {
         $g    = $groups[$key]
         $base = "{0}providers/Microsoft.Management/managementGroups/{1}/providers/Microsoft.Quota/groupQuotas/{2}/resourceProviders/Microsoft.Compute/locations/{3}" -f $ResourceManagerUrl, $g.ManagementGroup, $g.GroupName, $Region
