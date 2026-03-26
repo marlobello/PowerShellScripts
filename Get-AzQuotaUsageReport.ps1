@@ -550,10 +550,13 @@ function Get-QuotaGroupDetails {
         # Returns properties.resourceName and properties.shareableQuota per family.
         foreach ($subId in $g.MemberSubIds) {
             $subAllocUri  = "{0}providers/Microsoft.Management/managementGroups/{1}/subscriptions/{2}/providers/Microsoft.Quota/groupQuotas/{3}/resourceProviders/Microsoft.Compute/quotaAllocations/{4}?api-version=2025-03-01" -f $ResourceManagerUrl, $g.ManagementGroup, $subId, $g.GroupName, $Region
+            Write-Verbose "  [ShareableQuota] GET $subAllocUri"
             $subAllocResp = Invoke-AzRest -Method GET -Uri $subAllocUri -ErrorAction SilentlyContinue
             if ($subAllocResp -and $subAllocResp.StatusCode -eq 200) {
                 $subShareable = @{}
-                foreach ($entry in ($subAllocResp.Content | ConvertFrom-Json).value) {
+                $parsed = $subAllocResp.Content | ConvertFrom-Json
+                Write-Verbose "  [ShareableQuota] HTTP 200 — $(@($parsed.value).Count) entries. Raw: $($subAllocResp.Content)"
+                foreach ($entry in $parsed.value) {
                     # Resource name: try properties.resourceName, then properties.name.value,
                     # then fall back to the top-level name (may be a short name or full path).
                     $resourceName = $entry.properties.resourceName
@@ -565,11 +568,17 @@ function Get-QuotaGroupDetails {
                     $sqValue = $entry.properties.shareableQuota
                     if ($null -eq $sqValue) { $sqValue = $entry.properties.sharableQuota }
 
+                    Write-Verbose "  [ShareableQuota]   $resourceName -> sqValue=$sqValue"
                     if ($null -ne $sqValue) {
                         $subShareable[$resourceName] = [int]$sqValue
                     }
                 }
+                Write-Verbose "  [ShareableQuota] Stored $($subShareable.Count) entries for sub $subId"
                 $g.SubscriptionAllocations[$subId.ToLower()] = $subShareable
+            } else {
+                $sc = if ($subAllocResp) { $subAllocResp.StatusCode } else { 'no response' }
+                Write-Warning "ShareableQuota: quotaAllocations API returned HTTP $sc for sub $subId in group $($g.GroupName). Run with -Verbose for full URL."
+                Write-Verbose "  [ShareableQuota] Response body: $(if ($subAllocResp) { $subAllocResp.Content } else { 'null' })"
             }
         }
     }
