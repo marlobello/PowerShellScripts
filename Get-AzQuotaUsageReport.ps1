@@ -962,109 +962,143 @@ function New-MarkdownReport {
         $md.Add("---")
         $md.Add("")
     } else {
+        # Count unique analyzed subs that are in any group
         $groupedSubIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($grp in $GroupDetails) {
             foreach ($sid in $grp.MemberSubIds) { $groupedSubIds.Add($sid) | Out-Null }
         }
-        $md.Add("$($GroupDetails.Count) Quota Group(s) found covering $($groupedSubIds.Count) of $($uniqueSubs.Count) analyzed subscription(s).")
+        # Count total unique subs across all groups (including non-analyzed)
+        $allGroupSubIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($grp in $GroupDetails) {
+            foreach ($sid in $grp.AllMemberSubIds) { $allGroupSubIds.Add($sid) | Out-Null }
+        }
+        $notAnalyzedCount = $allGroupSubIds.Count - $groupedSubIds.Count
+
+        $summaryLine = "$($GroupDetails.Count) Quota Group(s) found. " +
+            "$($groupedSubIds.Count) of $($uniqueSubs.Count) analyzed subscription(s) are group member(s). " +
+            "The group(s) contain $($allGroupSubIds.Count) subscription(s) in total" +
+            $(if ($notAnalyzedCount -gt 0) { " ($notAnalyzedCount not included in this report's analysis)." } else { "." })
+        $md.Add($summaryLine)
         $md.Add("")
 
         foreach ($grp in ($GroupDetails | Sort-Object GroupDisplayName)) {
             $md.Add("### Quota Group: ``$($grp.GroupDisplayName)`` — $($grp.ManagementGroup)")
             $md.Add("")
 
-            $memberDisplays = foreach ($sid in $grp.MemberSubIds) {
+            # Show all group members; mark those not in this report's scope
+            $memberDisplays = foreach ($sid in ($grp.AllMemberSubIds | Sort-Object)) {
                 $subInfo = $uniqueSubs | Where-Object { $_.SubscriptionId -ieq $sid } | Select-Object -First 1
-                if ($subInfo) { "$($subInfo.SubscriptionName) (``$($subInfo.SubscriptionId)``)" } else { "``$sid``" }
+                if ($subInfo) {
+                    "$($subInfo.SubscriptionName) (``$($subInfo.SubscriptionId)``)"
+                } else {
+                    "``$sid`` *(not analyzed)*"
+                }
             }
-            $md.Add("**Member Subscriptions:** $($memberDisplays -join ', ')")
+            $md.Add("**Member Subscriptions ($($grp.AllMemberSubIds.Count)):** $($memberDisplays -join ', ')")
             $md.Add("")
 
             # ── Per-Family breakdown: Group → SKU → Subscription rows ───────────
-            $memberResults = @($Results | Where-Object { $grp.MemberSubIds.Contains($_.SubscriptionId) })
+            # Show all group members; non-analyzed subs display '—' for quota data
+            # but still show their Shared Quota from the quotaAllocations API.
+            $analyzedResults = @($Results | Where-Object { $grp.MemberSubIds.Contains($_.SubscriptionId) })
 
-            if ($memberResults.Count -gt 0) {
-                foreach ($family in $CpuFamilies) {
-                    $familyRows = @($memberResults | Where-Object { $_.Family -eq $family })
-                    if ($familyRows.Count -eq 0) { continue }
+            foreach ($family in $CpuFamilies) {
+                # Resolve the display name from analyzed results if available
+                $displayName = ($analyzedResults |
+                    Where-Object { $_.Family -eq $family -and $_.FamilyDisplayName -ne $family } |
+                    Select-Object -First 1).FamilyDisplayName
+                if ([string]::IsNullOrEmpty($displayName)) { $displayName = $family }
 
-                    $displayName = ($familyRows | Where-Object { $_.FamilyDisplayName -ne $family } | Select-Object -First 1).FamilyDisplayName
-                    if ([string]::IsNullOrEmpty($displayName)) { $displayName = $family }
+                # Only render this family if at least one member has allocation data or quota results
+                $hasFamilyData = ($analyzedResults | Where-Object { $_.Family -eq $family }) -or
+                    ($grp.AllMemberSubIds | Where-Object {
+                        $sid = $_
+                        $grp.SubscriptionAllocations.ContainsKey($sid.ToLower()) -and
+                        @($grp.SubscriptionAllocations[$sid.ToLower()] | Where-Object {
+                            $_.name -eq $family -or $_.properties.resourceName -eq $family -or
+                            $_.properties.name.value -eq $family
+                        }).Count -gt 0
+                    })
+                if (-not $hasFamilyData) { continue }
 
-                    $md.Add("#### $displayName")
-                    $md.Add("")
-                    $md.Add("| Subscription | Used vCPUs | vCPU Limit | Utilization | Shared Quota |")
-                    $md.Add("|---|---:|---:|---:|---:|")
+                $md.Add("#### $displayName")
+                $md.Add("")
+                $md.Add("| Subscription | Used vCPUs | vCPU Limit | Utilization | Shared Quota |")
+                $md.Add("|---|---:|---:|---:|---:|")
 
-                    $totalUsed      = 0
-                    $totalLimit     = 0
+                $totalUsed  = 0
+                $totalLimit = 0
 
-                    foreach ($row in ($familyRows | Sort-Object SubscriptionName)) {
-                        $utilDisplay  = if ($row.UtilizationPct -gt 80) { "⚠️ $($row.UtilizationPct)%" } else { "$($row.UtilizationPct)%" }
+                foreach ($sid in ($grp.AllMemberSubIds | Sort-Object)) {
+                    $subInfo    = $uniqueSubs | Where-Object { $_.SubscriptionId -ieq $sid } | Select-Object -First 1
+                    $subName    = if ($subInfo) { $subInfo.SubscriptionName } else { "``$sid`` *(not analyzed)*" }
+                    $quotaRow   = $analyzedResults | Where-Object { $_.SubscriptionId -ieq $sid -and $_.Family -eq $family } | Select-Object -First 1
 
-                        # Find the matching allocation entry for this subscription + family.
-                        # The API resource name field and shareableQuota spelling vary across
-                        # API versions, so check every possible name field using PowerShell's
-                        # case-insensitive -eq operator, and try both quota field spellings.
-                        $shareableQuota = $null
-                        if ($grp.SubscriptionAllocations -and
-                            $grp.SubscriptionAllocations.ContainsKey($row.SubscriptionId.ToLower())) {
-                            $allocEntries = $grp.SubscriptionAllocations[$row.SubscriptionId.ToLower()]
-                            $matchEntry = $allocEntries | Where-Object {
-                                $_.name                         -eq $row.Family -or
-                                $_.properties.resourceName      -eq $row.Family -or
-                                $_.properties.name.value        -eq $row.Family -or
-                                $_.name                         -eq $row.FamilyDisplayName -or
-                                $_.properties.name.localizedValue -eq $row.FamilyDisplayName
-                            } | Select-Object -First 1
-                            if ($matchEntry) {
-                                $sqValue = $matchEntry.properties.shareableQuota
-                                if ($null -eq $sqValue) { $sqValue = $matchEntry.properties.sharableQuota }
-                                if ($null -ne $sqValue) { $shareableQuota = [int]$sqValue }
-                            }
-                        }
-                        $shareDisplay = if ($null -ne $shareableQuota) {
-                            if ($shareableQuota -gt 0)     { "$shareableQuota (from QG)" }
-                            elseif ($shareableQuota -lt 0) { "$([Math]::Abs($shareableQuota)) (given to QG)" }
-                            else                           { "0" }
-                        } else { "—" }
-                        $md.Add("| $($row.SubscriptionName) | $($row.CoresUsed) | $($row.CoresLimit) | $utilDisplay | $shareDisplay |")
-
-                        $totalUsed  += $row.CoresUsed
-                        $totalLimit += $row.CoresLimit
+                    if ($quotaRow) {
+                        $usedDisplay  = $quotaRow.CoresUsed
+                        $limitDisplay = $quotaRow.CoresLimit
+                        $utilDisplay  = if ($quotaRow.UtilizationPct -gt 80) { "⚠️ $($quotaRow.UtilizationPct)%" } else { "$($quotaRow.UtilizationPct)%" }
+                        $totalUsed   += $quotaRow.CoresUsed
+                        $totalLimit  += $quotaRow.CoresLimit
+                    } else {
+                        $usedDisplay  = "—"
+                        $limitDisplay = "—"
+                        $utilDisplay  = "—"
                     }
 
-                    $totalUtil        = if ($totalLimit -gt 0) { [math]::Round(($totalUsed / $totalLimit) * 100, 1) } else { 0 }
-                    $totalUtilDisplay = if ($totalUtil -gt 80) { "⚠️ $totalUtil%" } else { "$totalUtil%" }
-
-                    # Compute net shareableQuota across ALL group members (not just analyzed ones)
-                    # so the "available in QG" total reflects the true group-wide position.
-                    $netShareable    = $null
-                    $anyShareableAll = $false
-                    foreach ($allSubId in $grp.AllMemberSubIds) {
-                        if (-not $grp.SubscriptionAllocations.ContainsKey($allSubId.ToLower())) { continue }
-                        $allEntries = $grp.SubscriptionAllocations[$allSubId.ToLower()]
-                        $allMatch = $allEntries | Where-Object {
+                    # Shared Quota — available for all members regardless of analysis scope
+                    $shareableQuota = $null
+                    if ($grp.SubscriptionAllocations.ContainsKey($sid.ToLower())) {
+                        $allocEntries = $grp.SubscriptionAllocations[$sid.ToLower()]
+                        $matchEntry = $allocEntries | Where-Object {
                             $_.name                           -eq $family -or
                             $_.properties.resourceName        -eq $family -or
                             $_.properties.name.value          -eq $family -or
+                            $_.name                           -eq $displayName -or
                             $_.properties.name.localizedValue -eq $displayName
                         } | Select-Object -First 1
-                        if ($allMatch) {
-                            $sqVal = $allMatch.properties.shareableQuota
-                            if ($null -eq $sqVal) { $sqVal = $allMatch.properties.sharableQuota }
-                            if ($null -ne $sqVal) {
-                                $netShareable    = ($null -eq $netShareable) ? [int]$sqVal : ($netShareable + [int]$sqVal)
-                                $anyShareableAll = $true
-                            }
+                        if ($matchEntry) {
+                            $sqValue = $matchEntry.properties.shareableQuota
+                            if ($null -eq $sqValue) { $sqValue = $matchEntry.properties.sharableQuota }
+                            if ($null -ne $sqValue) { $shareableQuota = [int]$sqValue }
                         }
                     }
-                    $totalShareDisplay = if ($anyShareableAll) { "$([Math]::Abs($netShareable)) available in QG" } else { "—" }
-                    $md.Add("| **Total** | **$totalUsed** | **$totalLimit** | **$totalUtilDisplay** | **$totalShareDisplay** |")
-                    $md.Add("")
+                    $shareDisplay = if ($null -ne $shareableQuota) {
+                        if ($shareableQuota -gt 0)     { "$shareableQuota (from QG)" }
+                        elseif ($shareableQuota -lt 0) { "$([Math]::Abs($shareableQuota)) (given to QG)" }
+                        else                           { "0" }
+                    } else { "—" }
+
+                    $md.Add("| $subName | $usedDisplay | $limitDisplay | $utilDisplay | $shareDisplay |")
                 }
-            } else {
-                $md.Add("_No quota data collected for member subscriptions._")
+
+                $totalUtil        = if ($totalLimit -gt 0) { [math]::Round(($totalUsed / $totalLimit) * 100, 1) } else { 0 }
+                $totalUtilDisplay = if ($totalLimit -gt 0) { if ($totalUtil -gt 80) { "⚠️ $totalUtil%" } else { "$totalUtil%" } } else { "—" }
+
+                # Net shareableQuota across ALL group members
+                $netShareable    = $null
+                $anyShareableAll = $false
+                foreach ($allSubId in $grp.AllMemberSubIds) {
+                    if (-not $grp.SubscriptionAllocations.ContainsKey($allSubId.ToLower())) { continue }
+                    $allMatch = $grp.SubscriptionAllocations[$allSubId.ToLower()] | Where-Object {
+                        $_.name                           -eq $family -or
+                        $_.properties.resourceName        -eq $family -or
+                        $_.properties.name.value          -eq $family -or
+                        $_.properties.name.localizedValue -eq $displayName
+                    } | Select-Object -First 1
+                    if ($allMatch) {
+                        $sqVal = $allMatch.properties.shareableQuota
+                        if ($null -eq $sqVal) { $sqVal = $allMatch.properties.sharableQuota }
+                        if ($null -ne $sqVal) {
+                            $netShareable    = ($null -eq $netShareable) ? [int]$sqVal : ($netShareable + [int]$sqVal)
+                            $anyShareableAll = $true
+                        }
+                    }
+                }
+                $totalShareDisplay = if ($anyShareableAll) { "$([Math]::Abs($netShareable)) available in QG" } else { "—" }
+                $totalUsedDisplay  = if ($totalLimit -gt 0) { $totalUsed } else { "—" }
+                $totalLimitDisplay = if ($totalLimit -gt 0) { $totalLimit } else { "—" }
+                $md.Add("| **Total (analyzed subs)** | **$totalUsedDisplay** | **$totalLimitDisplay** | **$totalUtilDisplay** | **$totalShareDisplay** |")
                 $md.Add("")
             }
 
