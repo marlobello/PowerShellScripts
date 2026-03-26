@@ -954,18 +954,14 @@ function New-MarkdownReport {
 
         foreach ($grp in ($GroupDetails | Sort-Object GroupDisplayName)) {
             $heading = if ($grp.GroupDisplayName -and $grp.GroupDisplayName -ne $grp.GroupName) { $grp.GroupDisplayName } else { $grp.GroupName }
-            $md.Add("### $heading — $($grp.ManagementGroup)")
+            $md.Add("### $heading (``$($grp.GroupName)``) — $($grp.ManagementGroup)")
             $md.Add("")
-            $md.Add("| | |")
-            $md.Add("|---|---|")
-            $md.Add("| **Group Name** | ``$($grp.GroupName)`` |")
-            $md.Add("| **Group Type** | $($grp.GroupType) |")
 
             $memberDisplays = foreach ($sid in $grp.MemberSubIds) {
                 $subInfo = $uniqueSubs | Where-Object { $_.SubscriptionId -ieq $sid } | Select-Object -First 1
                 if ($subInfo) { "$($subInfo.SubscriptionName) (``$($subInfo.SubscriptionId)``)" } else { "``$sid``" }
             }
-            $md.Add("| **Member Subscriptions** | $($memberDisplays -join ', ') |")
+            $md.Add("**Member Subscriptions:** $($memberDisplays -join ', ')")
             $md.Add("")
 
             # ── Per-Family breakdown: Group → SKU → Subscription rows ───────────
@@ -981,7 +977,7 @@ function New-MarkdownReport {
 
                     $md.Add("#### $displayName")
                     $md.Add("")
-                    $md.Add("| Subscription | Used vCPUs | Limit vCPUs | Utilization | Shareable Quota |")
+                    $md.Add("| Subscription | Used vCPUs | vCPU Limit | Utilization | Shared Quota |")
                     $md.Add("|---|---:|---:|---:|---:|")
 
                     $totalUsed      = 0
@@ -1013,7 +1009,11 @@ function New-MarkdownReport {
                                 if ($null -ne $sqValue) { $shareableQuota = [int]$sqValue }
                             }
                         }
-                        $shareDisplay = if ($null -ne $shareableQuota) { $shareableQuota } else { "—" }
+                        $shareDisplay = if ($null -ne $shareableQuota) {
+                            if ($shareableQuota -gt 0)     { "$shareableQuota (from QG)" }
+                            elseif ($shareableQuota -lt 0) { "$shareableQuota (given to QG)" }
+                            else                           { "0" }
+                        } else { "—" }
                         $md.Add("| $($row.SubscriptionName) | $($row.CoresUsed) | $($row.CoresLimit) | $utilDisplay | $shareDisplay |")
 
                         $totalUsed  += $row.CoresUsed
@@ -1026,14 +1026,9 @@ function New-MarkdownReport {
 
                     $totalUtil        = if ($totalLimit -gt 0) { [math]::Round(($totalUsed / $totalLimit) * 100, 1) } else { 0 }
                     $totalUtilDisplay = if ($totalUtil -gt 80) { "⚠️ $totalUtil%" } else { "$totalUtil%" }
-                    $totalShareDisplay= if ($anyShareable) { $totalShareable } else { "—" }
+                    $totalShareDisplay= if ($anyShareable) { "$totalShareable available in QG" } else { "—" }
                     $md.Add("| **Total** | **$totalUsed** | **$totalLimit** | **$totalUtilDisplay** | **$totalShareDisplay** |")
                     $md.Add("")
-
-                    if ($anyShareable) {
-                        $md.Add("> ℹ️ **Shareable Quota**: a negative value means the subscription has loaned quota to the group; positive means it has borrowed from the group. The **Total** row shows the net quota currently available from the group for this family.")
-                        $md.Add("")
-                    }
                 }
             } else {
                 $md.Add("_No quota data collected for member subscriptions._")
