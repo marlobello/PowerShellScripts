@@ -244,12 +244,16 @@ function Resolve-CpuFamilies {
       Get-AzQuotaUsage — returns current usage per named resource
 
     Both cmdlets target the same scope and are merged by NameValue so callers get
-    a complete object with both Limit and CurrentValue, in the same shape as the
-    Get-AzVMUsage expanded output.
+    a complete object with both Limit, CurrentValue, and ShareableQuota.
 
-    Returns an empty array if both cmdlets return no entries (e.g. Microsoft.Quota
-    is not available in the environment). The caller is responsible for falling back
-    to Get-AzVMUsage in that case.
+    ShareableQuota is fetched via a supplementary Invoke-AzRest call because the
+    Az.Quota module's LimitObject class does not expose this field even though the
+    underlying REST API returns it under properties.limit.sharableQuota when a
+    subscription has limitType = "Shared" (i.e., it is a member of a quota group
+    with allocated group quota). For independent subscriptions the field is absent
+    and ShareableQuota is returned as null.
+
+    Returns an empty array if both module cmdlets return no entries.
 
 .PARAMETER SubscriptionId
     The Azure subscription ID to query.
@@ -257,15 +261,19 @@ function Resolve-CpuFamilies {
 .PARAMETER Region
     The Azure region to query (e.g. 'eastus').
 
+.PARAMETER ResourceManagerUrl
+    Base URL of the Azure Resource Manager endpoint for the current cloud.
+
 .OUTPUTS
-    Array of PSCustomObjects with Value, LocalizedValue, CurrentValue, and Limit —
-    same shape as the Get-AzVMUsage expanded output. Returns empty array on failure
-    or when the subscription has no compute quota in the region.
+    Array of PSCustomObjects with Value, LocalizedValue, CurrentValue, Limit, and
+    ShareableQuota (int or null). Returns empty array on failure or when the
+    subscription has no compute quota in the region.
 #>
 function Get-QuotaFromModule {
     param (
         [string]$SubscriptionId,
-        [string]$Region
+        [string]$Region,
+        [string]$ResourceManagerUrl
     )
 
     try {
@@ -287,6 +295,20 @@ function Get-QuotaFromModule {
             }
         }
 
+        # Fetch sharableQuota via REST — the Az.Quota module's LimitObject does not
+        # expose this field. It appears under properties.limit.sharableQuota only when
+        # limitType == "Shared" (subscription is in a quota group with allocated quota).
+        $sharableLookup = @{}
+        $sqUri  = "{0}{1}/providers/Microsoft.Quota/quotas?api-version=2024-12-18-preview" -f $ResourceManagerUrl, $scope
+        $sqResp = Invoke-AzRest -Method GET -Uri $sqUri -ErrorAction SilentlyContinue
+        if ($sqResp -and $sqResp.StatusCode -eq 200) {
+            foreach ($entry in ($sqResp.Content | ConvertFrom-Json).value) {
+                if ($null -ne $entry.properties.limit.sharableQuota) {
+                    $sharableLookup[$entry.name] = [int]$entry.properties.limit.sharableQuota
+                }
+            }
+        }
+
         $result = foreach ($entry in $quotaEntries) {
             if ([string]::IsNullOrEmpty($entry.NameValue)) { continue }
 
@@ -295,6 +317,7 @@ function Get-QuotaFromModule {
                 LocalizedValue = $entry.NameLocalizedValue
                 CurrentValue   = if ($usageLookup.ContainsKey($entry.NameValue)) { $usageLookup[$entry.NameValue] } else { 0 }
                 Limit          = if ($null -ne $entry.Limit -and $null -ne $entry.Limit.Value) { [int]$entry.Limit.Value } else { 0 }
+                ShareableQuota = if ($sharableLookup.ContainsKey($entry.NameValue)) { $sharableLookup[$entry.NameValue] } else { $null }
             }
         }
 
@@ -660,7 +683,7 @@ resources
         }
 
         # Primary quota source: Az.Quota module (Get-AzQuota for limits + Get-AzQuotaUsage for usage)
-        $quotaApiResults = Get-QuotaFromModule -SubscriptionId $SubscriptionId -Region $Region
+        $quotaApiResults = Get-QuotaFromModule -SubscriptionId $SubscriptionId -Region $Region -ResourceManagerUrl $ResourceManagerUrl
 
         # Fallback quota source: classic Compute usage API (Get-AzVMUsage)
         # Used when the Az.Quota module returns no data (e.g. provider not registered or transient failure)
@@ -697,11 +720,12 @@ resources
                 Write-Warning "Family '$family' was not found in quota data for region '$Region' in subscription '$($subscription.Name)'. Both the Microsoft.Quota API and Get-AzVMUsage were tried. Verify the name matches the Value or LocalizedValue from: Get-AzVMUsage -Location '$Region' | Select-Object -ExpandProperty Name | Select-Object Value, LocalizedValue"
             }
 
-            $coresUsed  = if ($familyFound) { [int]$familyUsage.CurrentValue } else { 0 }
-            $coresLimit = if ($familyFound) { [int]$familyUsage.Limit } else { 0 }
-            $utilPct    = if ($coresLimit -gt 0) { [math]::Round(($coresUsed / $coresLimit) * 100, 1) } else { 0 }
-            $displayName= if ($familyFound) { $familyUsage.LocalizedValue } else { $family }
-            $quotaStatus= if (-not $familyFound) { 'NotFound' } elseif ($coresLimit -eq 0) { 'ZeroLimit' } else { 'OK' }
+            $coresUsed      = if ($familyFound) { [int]$familyUsage.CurrentValue } else { 0 }
+            $coresLimit     = if ($familyFound) { [int]$familyUsage.Limit } else { 0 }
+            $utilPct        = if ($coresLimit -gt 0) { [math]::Round(($coresUsed / $coresLimit) * 100, 1) } else { 0 }
+            $displayName    = if ($familyFound) { $familyUsage.LocalizedValue } else { $family }
+            $quotaStatus    = if (-not $familyFound) { 'NotFound' } elseif ($coresLimit -eq 0) { 'ZeroLimit' } else { 'OK' }
+            $shareableQuota = if ($familyFound -and $null -ne $familyUsage.ShareableQuota) { $familyUsage.ShareableQuota } else { $null }
 
             # Filter SKUs using the resolved canonical API name
             $familySkus  = $allComputeSkus | Where-Object { $_.Family -eq $canonicalFamilyName }
@@ -744,6 +768,7 @@ resources
                 CoresUsed        = $coresUsed
                 CoresLimit       = $coresLimit
                 UtilizationPct   = $utilPct
+                ShareableQuota   = $shareableQuota
                 QuotaStatus      = $quotaStatus
                 SKUDetails       = @($skuDetails)
             }
@@ -910,7 +935,6 @@ function New-MarkdownReport {
             $md.Add("| **Group Name** | ``$($grp.GroupName)`` |")
             $md.Add("| **Group Type** | $($grp.GroupType) |")
 
-            # List member subscriptions, resolving names from $uniqueSubs
             $memberDisplays = foreach ($sid in $grp.MemberSubIds) {
                 $subInfo = $uniqueSubs | Where-Object { $_.SubscriptionId -ieq $sid } | Select-Object -First 1
                 if ($subInfo) { "$($subInfo.SubscriptionName) (``$($subInfo.SubscriptionId)``)" } else { "``$sid``" }
@@ -918,76 +942,78 @@ function New-MarkdownReport {
             $md.Add("| **Member Subscriptions** | $($memberDisplays -join ', ') |")
             $md.Add("")
 
-            # ── Member Subscription Quota Summary ──────────────────────────────
-            # Derived from the per-subscription quota data already collected —
-            # shows how much quota the group's member subs are collectively using.
+            # ── Per-Family breakdown: Group → SKU → Subscription rows ───────────
             $memberResults = @($Results | Where-Object { $grp.MemberSubIds.Contains($_.SubscriptionId) })
 
-            $md.Add("**Member Subscription Quota Summary (``$Region``)**")
-            $md.Add("")
-
             if ($memberResults.Count -gt 0) {
-                $md.Add("| CPU Family | Total Used (vCPUs) | Total Limit (vCPUs) | Utilization |")
-                $md.Add("|---|---:|---:|---:|")
-
                 foreach ($family in $CpuFamilies) {
                     $familyRows = @($memberResults | Where-Object { $_.Family -eq $family })
                     if ($familyRows.Count -eq 0) { continue }
 
-                    $totalUsed  = ($familyRows | Measure-Object CoresUsed  -Sum).Sum
-                    $totalLimit = ($familyRows | Measure-Object CoresLimit -Sum).Sum
-                    $utilPct    = if ($totalLimit -gt 0) { [math]::Round(($totalUsed / $totalLimit) * 100, 1) } else { 0 }
-                    $utilDisplay= if ($utilPct -gt 80) { "⚠️ $utilPct%" } else { "$utilPct%" }
-
                     $displayName = ($familyRows | Where-Object { $_.FamilyDisplayName -ne $family } | Select-Object -First 1).FamilyDisplayName
                     if ([string]::IsNullOrEmpty($displayName)) { $displayName = $family }
 
-                    $md.Add("| $displayName | $totalUsed | $totalLimit | $utilDisplay |")
+                    $md.Add("#### $displayName")
+                    $md.Add("")
+                    $md.Add("| Subscription | Used vCPUs | Limit vCPUs | Utilization | Shareable Quota |")
+                    $md.Add("|---|---:|---:|---:|---:|")
+
+                    $totalUsed      = 0
+                    $totalLimit     = 0
+                    $totalShareable = $null
+                    $anyShareable   = $false
+
+                    foreach ($row in ($familyRows | Sort-Object SubscriptionName)) {
+                        $utilDisplay  = if ($row.UtilizationPct -gt 80) { "⚠️ $($row.UtilizationPct)%" } else { "$($row.UtilizationPct)%" }
+                        $shareDisplay = if ($null -ne $row.ShareableQuota) { $row.ShareableQuota } else { "—" }
+                        $md.Add("| $($row.SubscriptionName) | $($row.CoresUsed) | $($row.CoresLimit) | $utilDisplay | $shareDisplay |")
+
+                        $totalUsed  += $row.CoresUsed
+                        $totalLimit += $row.CoresLimit
+                        if ($null -ne $row.ShareableQuota) {
+                            $totalShareable = ($null -eq $totalShareable) ? $row.ShareableQuota : ($totalShareable + $row.ShareableQuota)
+                            $anyShareable   = $true
+                        }
+                    }
+
+                    $totalUtil        = if ($totalLimit -gt 0) { [math]::Round(($totalUsed / $totalLimit) * 100, 1) } else { 0 }
+                    $totalUtilDisplay = if ($totalUtil -gt 80) { "⚠️ $totalUtil%" } else { "$totalUtil%" }
+                    $totalShareDisplay= if ($anyShareable) { $totalShareable } else { "—" }
+                    $md.Add("| **Total** | **$totalUsed** | **$totalLimit** | **$totalUtilDisplay** | **$totalShareDisplay** |")
+                    $md.Add("")
+
+                    if ($anyShareable) {
+                        $md.Add("> ℹ️ **Shareable Quota**: a negative value means the subscription has loaned quota to the group; positive means it has borrowed from the group. The **Total** row shows the net quota currently available from the group for this family.")
+                        $md.Add("")
+                    }
                 }
             } else {
                 $md.Add("_No quota data collected for member subscriptions._")
+                $md.Add("")
             }
-            $md.Add("")
 
-            # ── Group-Level Quota Limits ────────────────────────────────────────
-            # Sourced from the GroupQuotas API (preview). If not configured, a
-            # note is shown. The API returns limits/allocations at the group level,
-            # independent of what individual subscriptions have been granted.
-            $md.Add("**Group-Level Quota Limits (``$Region``)**")
-            $md.Add("")
-
+            # ── Group-Level Quota Limits from the GroupQuotas API (shown only if data exists)
             if ($null -ne $grp.GroupLimits -and @($grp.GroupLimits).Count -gt 0) {
-                # Resolve the family name from whichever property the API populates
                 $relevantLimits = @($grp.GroupLimits | Where-Object {
-                    $rName = if ($_.name)                          { $_.name } `
-                             elseif ($_.properties.resourceName)  { $_.properties.resourceName } `
-                             elseif ($_.properties.name.value)    { $_.properties.name.value } `
-                             else                                  { $null }
+                    $rName = if ($_.name) { $_.name } elseif ($_.properties.resourceName) { $_.properties.resourceName } else { $_.properties.name.value }
                     $rName -and ($CpuFamilies -contains $rName)
                 })
 
                 if ($relevantLimits.Count -gt 0) {
+                    $md.Add("**Group-Level Quota Limits (``$Region``)**")
+                    $md.Add("")
                     $md.Add("| CPU Family | Group Limit (vCPUs) | Available to Allocate |")
                     $md.Add("|---|---:|---:|")
                     foreach ($lim in $relevantLimits) {
-                        $rName     = if ($lim.name)                         { $lim.name } `
-                                     elseif ($lim.properties.resourceName) { $lim.properties.resourceName } `
-                                     else                                   { $lim.properties.name.value }
-                        $limitVal  = if ($lim.properties.limit.value)          { [int]$lim.properties.limit.value } `
-                                     elseif ($lim.limit)                       { [int]$lim.limit } else { 0 }
-                        $available = if ($null -ne $lim.properties.availableLimit) { [int]$lim.properties.availableLimit } `
-                                     else { $limitVal }
-                        $md.Add("| $rName | $limitVal | $available |")
+                        $rName    = if ($lim.name) { $lim.name } elseif ($lim.properties.resourceName) { $lim.properties.resourceName } else { $lim.properties.name.value }
+                        $limitVal = if ($lim.properties.limit.value) { [int]$lim.properties.limit.value } elseif ($lim.limit) { [int]$lim.limit } else { 0 }
+                        $avail    = if ($null -ne $lim.properties.availableLimit) { [int]$lim.properties.availableLimit } else { $limitVal }
+                        $md.Add("| $rName | $limitVal | $avail |")
                     }
-                } else {
-                    $md.Add("_Group quota limits found but none match the analyzed CPU families._")
+                    $md.Add("")
                 }
-            } else {
-                $md.Add("> ℹ️ Group quota limits have not been configured or could not be retrieved for this group.")
-                $md.Add("> To configure group quota, see: [Azure Quota Groups](https://learn.microsoft.com/azure/quotas/quota-groups)")
             }
 
-            $md.Add("")
             $md.Add("---")
             $md.Add("")
         }
