@@ -872,7 +872,8 @@ function New-MarkdownReport {
         [string]$Region,
         [string[]]$CpuFamilies,
         [datetime]$GeneratedAt,
-        [object[]]$GroupDetails = @()
+        [object[]]$GroupDetails = @(),
+        [hashtable]$SubNameLookup = @()
     )
 
     $md = [System.Collections.Generic.List[string]]::new()
@@ -991,7 +992,9 @@ function New-MarkdownReport {
                 if ($subInfo) {
                     "$($subInfo.SubscriptionName) (``$($subInfo.SubscriptionId)``)"
                 } else {
-                    "``$sid`` *(not analyzed)*"
+                    $resolvedName = $SubNameLookup[$sid.ToLower()]
+                    $label = if ($resolvedName) { "$resolvedName (``$sid``)" } else { "``$sid``" }
+                    "$label *(not analyzed)*"
                 }
             }
             $md.Add("**Member Subscriptions ($($grp.AllMemberSubIds.Count)):** $($memberDisplays -join ', ')")
@@ -1031,7 +1034,12 @@ function New-MarkdownReport {
 
                 foreach ($sid in ($grp.AllMemberSubIds | Sort-Object)) {
                     $subInfo    = $uniqueSubs | Where-Object { $_.SubscriptionId -ieq $sid } | Select-Object -First 1
-                    $subName    = if ($subInfo) { $subInfo.SubscriptionName } else { "``$sid`` *(not analyzed)*" }
+                    if ($subInfo) {
+                        $subName = $subInfo.SubscriptionName
+                    } else {
+                        $resolvedName = $SubNameLookup[$sid.ToLower()]
+                        $subName = if ($resolvedName) { "$resolvedName (``$sid``) *(not analyzed)*" } else { "``$sid`` *(not analyzed)*" }
+                    }
                     $quotaRow   = $analyzedResults | Where-Object { $_.SubscriptionId -ieq $sid -and $_.Family -eq $family } | Select-Object -First 1
 
                     if ($quotaRow) {
@@ -1302,14 +1310,35 @@ $groupDetails = Get-QuotaGroupDetails `
 
 Write-Host "Quota Groups found: $($groupDetails.Count)"
 
+# ── Resolve subscription names for all group members ────────────────────────────
+# Build a name lookup covering every subscription in every quota group — including
+# ones the user didn't provide as input (they appear in the report as non-analyzed).
+# Seed from already-collected results first (free), then call Get-AzSubscription
+# for any remaining IDs that only appear as group members.
+$subNameLookup = @{}
+foreach ($r in $allResults) {
+    if ($r.SubscriptionId -and $r.SubscriptionName) {
+        $subNameLookup[$r.SubscriptionId.ToLower()] = $r.SubscriptionName
+    }
+}
+
+foreach ($grp in $groupDetails) {
+    foreach ($sid in $grp.AllMemberSubIds) {
+        if ($subNameLookup.ContainsKey($sid.ToLower())) { continue }
+        $sub = Get-AzSubscription -SubscriptionId $sid -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+        $subNameLookup[$sid.ToLower()] = if ($sub) { $sub.Name } else { $null }
+    }
+}
+
 # ── Generate and write Markdown report ─────────────────────────────────────────
 Write-Host "`nGenerating Markdown report..."
 $markdownContent = New-MarkdownReport `
-    -Results      $allResults `
-    -Region       $Region `
-    -CpuFamilies  $resolvedFamilies `
-    -GeneratedAt  $scriptStart `
-    -GroupDetails $groupDetails
+    -Results             $allResults `
+    -Region              $Region `
+    -CpuFamilies         $resolvedFamilies `
+    -GeneratedAt         $scriptStart `
+    -GroupDetails        $groupDetails `
+    -SubNameLookup       $subNameLookup
 
 try {
     $markdownContent | Out-File -FilePath $reportPath -Encoding UTF8 -Force -ErrorAction Stop
