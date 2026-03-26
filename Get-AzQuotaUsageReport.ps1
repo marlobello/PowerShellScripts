@@ -519,7 +519,7 @@ function Get-QuotaGroupDetails {
                     MemberSubIds           = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
                     GroupLimits            = $null
                     GroupAllocations       = $null
-                    SubscriptionAllocations = @{}   # subId.ToLower() -> { resourceName -> shareableQuota }
+                    SubscriptionAllocations = @{}   # subId.ToLower() -> array of raw allocation objects from quotaAllocations API
                 }
             }
             $groups[$key].MemberSubIds.Add($subId) | Out-Null
@@ -547,34 +547,20 @@ function Get-QuotaGroupDetails {
         # GET {rm}providers/Microsoft.Management/managementGroups/{mg}/subscriptions/{subId}/
         #        providers/Microsoft.Quota/groupQuotas/{group}/resourceProviders/
         #        Microsoft.Compute/quotaAllocations/{region}?api-version=2025-03-01
-        # Returns properties.resourceName and properties.shareableQuota per family.
+        # Fetch per-subscription shareableQuota using the correct group-context endpoint:
+        # GET {rm}providers/Microsoft.Management/managementGroups/{mg}/subscriptions/{subId}/
+        #        providers/Microsoft.Quota/groupQuotas/{group}/resourceProviders/
+        #        Microsoft.Compute/quotaAllocations/{region}?api-version=2025-03-01
+        # Store raw objects so the report can do flexible name matching (field names vary).
         foreach ($subId in $g.MemberSubIds) {
             $subAllocUri  = "{0}providers/Microsoft.Management/managementGroups/{1}/subscriptions/{2}/providers/Microsoft.Quota/groupQuotas/{3}/resourceProviders/Microsoft.Compute/quotaAllocations/{4}?api-version=2025-03-01" -f $ResourceManagerUrl, $g.ManagementGroup, $subId, $g.GroupName, $Region
             Write-Verbose "  [ShareableQuota] GET $subAllocUri"
             $subAllocResp = Invoke-AzRest -Method GET -Uri $subAllocUri -ErrorAction SilentlyContinue
             if ($subAllocResp -and $subAllocResp.StatusCode -eq 200) {
-                $subShareable = @{}
                 $parsed = $subAllocResp.Content | ConvertFrom-Json
-                Write-Verbose "  [ShareableQuota] HTTP 200 — $(@($parsed.value).Count) entries. Raw: $($subAllocResp.Content)"
-                foreach ($entry in $parsed.value) {
-                    # Resource name: try properties.resourceName, then properties.name.value,
-                    # then fall back to the top-level name (may be a short name or full path).
-                    $resourceName = $entry.properties.resourceName
-                    if ([string]::IsNullOrEmpty($resourceName)) { $resourceName = $entry.properties.name.value }
-                    if ([string]::IsNullOrEmpty($resourceName))  { $resourceName = $entry.name }
-                    if ([string]::IsNullOrEmpty($resourceName))  { continue }
-
-                    # shareableQuota field name varies by API version: try both spellings.
-                    $sqValue = $entry.properties.shareableQuota
-                    if ($null -eq $sqValue) { $sqValue = $entry.properties.sharableQuota }
-
-                    Write-Verbose "  [ShareableQuota]   $resourceName -> sqValue=$sqValue"
-                    if ($null -ne $sqValue) {
-                        $subShareable[$resourceName] = [int]$sqValue
-                    }
-                }
-                Write-Verbose "  [ShareableQuota] Stored $($subShareable.Count) entries for sub $subId"
-                $g.SubscriptionAllocations[$subId.ToLower()] = $subShareable
+                $entries = @($parsed.value)
+                Write-Verbose "  [ShareableQuota] HTTP 200 — $($entries.Count) entries. Raw: $($subAllocResp.Content)"
+                $g.SubscriptionAllocations[$subId.ToLower()] = $entries
             } else {
                 $sc = if ($subAllocResp) { $subAllocResp.StatusCode } else { 'no response' }
                 Write-Warning "ShareableQuota: quotaAllocations API returned HTTP $sc for sub $subId in group $($g.GroupName). Run with -Verbose for full URL."
@@ -985,14 +971,25 @@ function New-MarkdownReport {
                     foreach ($row in ($familyRows | Sort-Object SubscriptionName)) {
                         $utilDisplay  = if ($row.UtilizationPct -gt 80) { "⚠️ $($row.UtilizationPct)%" } else { "$($row.UtilizationPct)%" }
 
-                        # Look up shareableQuota from the group's per-subscription allocation data
-                        # (fetched via the quotaAllocations endpoint in Get-QuotaGroupDetails)
+                        # Find the matching allocation entry for this subscription + family.
+                        # The API resource name field and shareableQuota spelling vary across
+                        # API versions, so check every possible name field using PowerShell's
+                        # case-insensitive -eq operator, and try both quota field spellings.
                         $shareableQuota = $null
                         if ($grp.SubscriptionAllocations -and
                             $grp.SubscriptionAllocations.ContainsKey($row.SubscriptionId.ToLower())) {
-                            $subAlloc = $grp.SubscriptionAllocations[$row.SubscriptionId.ToLower()]
-                            if ($subAlloc.ContainsKey($row.Family)) {
-                                $shareableQuota = $subAlloc[$row.Family]
+                            $allocEntries = $grp.SubscriptionAllocations[$row.SubscriptionId.ToLower()]
+                            $matchEntry = $allocEntries | Where-Object {
+                                $_.name                         -eq $row.Family -or
+                                $_.properties.resourceName      -eq $row.Family -or
+                                $_.properties.name.value        -eq $row.Family -or
+                                $_.name                         -eq $row.FamilyDisplayName -or
+                                $_.properties.name.localizedValue -eq $row.FamilyDisplayName
+                            } | Select-Object -First 1
+                            if ($matchEntry) {
+                                $sqValue = $matchEntry.properties.shareableQuota
+                                if ($null -eq $sqValue) { $sqValue = $matchEntry.properties.sharableQuota }
+                                if ($null -ne $sqValue) { $shareableQuota = [int]$sqValue }
                             }
                         }
                         $shareDisplay = if ($null -ne $shareableQuota) { $shareableQuota } else { "—" }
