@@ -1272,7 +1272,10 @@ try {
 }
 
 $timestamp      = $scriptStart.ToString("yyyyMMdd")
-$reportFileName = if ($OutputFileName) { "$($OutputFileName.Trim()).md" } else { "QuotaReport_${Region}_${timestamp}.md" }
+$reportFileName = if ($OutputFileName) {
+    $base = $OutputFileName.Trim()
+    if ($base -notlike '*.md') { "$base.md" } else { $base }
+} else { "QuotaReport_${Region}_${timestamp}.md" }
 $reportPath     = Join-Path $outputDir $reportFileName
 
 $resourceManagerUrl = $azContext.Environment.ResourceManagerUrl
