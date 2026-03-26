@@ -81,6 +81,8 @@ param (
     [object[]]$CpuFamilies,
 
     [Parameter(Mandatory = $true, HelpMessage = "Single Azure region to analyze (e.g. 'eastus')")]
+    [ValidateNotNullOrEmpty()]
+    [ValidatePattern('^[a-z0-9]+$', ErrorMessage = "Region must be a lowercase Azure region name (e.g. 'eastus', 'uksouth').")]
     [string]$Region
 )
 
@@ -101,6 +103,10 @@ param (
 .PARAMETER Node
     A Management Group node object with a Children property (e.g. the result of
     Get-AzManagementGroup -Expand -Recurse, or a child node within that result).
+
+.PARAMETER Accumulator
+    A HashSet[string] that is populated in place with subscription IDs found in the
+    subtree. Must be initialized by the caller before the first invocation.
 
 .OUTPUTS
     Array of subscription ID strings found anywhere in the subtree.
@@ -430,7 +436,10 @@ function Get-QuotaGroupMembership {
         $groupResp     = Invoke-AzRest -Method GET -Uri $groupQuotaUri -ErrorAction SilentlyContinue
         if (-not $groupResp -or $groupResp.StatusCode -ne 200) { continue }
 
-        $groups = try { ($groupResp.Content | ConvertFrom-Json).value } catch { @() }
+        $groups = try { ($groupResp.Content | ConvertFrom-Json).value } catch {
+            Write-Warning "Failed to parse GroupQuotas response for MG '$mgName': $($_.Exception.Message)"
+            @()
+        }
         if (-not $groups) { continue }
 
         foreach ($group in $groups) {
@@ -442,7 +451,10 @@ function Get-QuotaGroupMembership {
             $subsResp = Invoke-AzRest -Method GET -Uri $subsUri -ErrorAction SilentlyContinue
             if (-not $subsResp -or $subsResp.StatusCode -ne 200) { continue }
 
-            $members = try { ($subsResp.Content | ConvertFrom-Json).value } catch { @() }
+            $members = try { ($subsResp.Content | ConvertFrom-Json).value } catch {
+                Write-Warning "Failed to parse group member subscriptions for group '$groupName' in MG '$mgName': $($_.Exception.Message)"
+                @()
+            }
             foreach ($member in $members) {
                 # The resource name IS the subscription ID in the group quota subscription resource
                 $memberId = $member.name
@@ -533,12 +545,18 @@ function Get-QuotaGroupDetails {
 
         $limResp = Invoke-AzRest -Method GET -Uri "$base/groupQuotaLimits?api-version=2023-06-01-preview" -ErrorAction SilentlyContinue
         if ($limResp -and $limResp.StatusCode -eq 200) {
-            $g.GroupLimits = try { ($limResp.Content | ConvertFrom-Json).value } catch { @() }
+            $g.GroupLimits = try { ($limResp.Content | ConvertFrom-Json).value } catch {
+                Write-Warning "Failed to parse groupQuotaLimits response for group '$($g.GroupName)': $($_.Exception.Message)"
+                @()
+            }
         }
 
         $allocResp = Invoke-AzRest -Method GET -Uri "$base/quotaAllocations?api-version=2023-06-01-preview" -ErrorAction SilentlyContinue
         if ($allocResp -and $allocResp.StatusCode -eq 200) {
-            $g.GroupAllocations = try { ($allocResp.Content | ConvertFrom-Json).value } catch { @() }
+            $g.GroupAllocations = try { ($allocResp.Content | ConvertFrom-Json).value } catch {
+                Write-Warning "Failed to parse groupAllocations response for group '$($g.GroupName)': $($_.Exception.Message)"
+                @()
+            }
         }
 
         # Fetch per-subscription shareableQuota using the correct group-context endpoint:
@@ -649,7 +667,7 @@ function Get-SubscriptionQuotaData {
 
         if ($quotaProvState -ne 'Registered') {
             $state = if ($quotaProvState) { $quotaProvState } else { 'unknown' }
-            Write-Warning "Subscription '$($subscription.Name)': Microsoft.Quota is not registered (state: '$state'). The Az.Quota module may not return data; Get-AzVMUsage will be used as a fallback if needed."
+            Write-Verbose "Subscription '$($subscription.Name)': Microsoft.Quota shows registration state '$state'. This is informational only — the Quota REST API is a platform endpoint and often works regardless. Get-AzVMUsage will be used as a fallback if Az.Quota returns no data."
         }
 
         # Get zone mapping (logical → physical) for this subscription + region
@@ -738,14 +756,15 @@ resources
             # Filter SKUs using the resolved canonical API name
             $familySkus  = $allComputeSkus | Where-Object { $_.Family -eq $canonicalFamilyName }
             $skuDetails  = foreach ($sku in $familySkus) {
-                $logicalZones = @($sku.LocationInfo.Zones | Sort-Object)
+                $logicalZones = @(if ($sku.LocationInfo -and $sku.LocationInfo.Zones) { $sku.LocationInfo.Zones | Sort-Object } else { @() })
 
                 $logicalRestricted = @()
                 $regionRestricted  = $false
 
-                foreach ($restriction in $sku.Restrictions) {
+                foreach ($restriction in @($sku.Restrictions)) {
+                    if (-not $restriction) { continue }
                     if ($restriction.Type -eq "Zone") {
-                        $logicalRestricted = @($restriction.RestrictionInfo.Zones | Sort-Object)
+                        $logicalRestricted = @(if ($restriction.RestrictionInfo -and $restriction.RestrictionInfo.Zones) { $restriction.RestrictionInfo.Zones | Sort-Object } else { @() })
                     } elseif ($restriction.Type -eq "Location") {
                         $regionRestricted = $true
                     }
@@ -787,7 +806,7 @@ resources
         return @($results)
 
     } catch {
-        Write-Warning "Failed to query subscription $SubscriptionId`: $($_.Exception.Message)"
+        Write-Warning "Failed to query subscription $SubscriptionId in region '$Region'`: $($_.Exception.Message)"
         return @()
     }
 }
@@ -1025,7 +1044,7 @@ function New-MarkdownReport {
             if ($null -ne $grp.GroupLimits -and @($grp.GroupLimits).Count -gt 0) {
                 $relevantLimits = @($grp.GroupLimits | Where-Object {
                     $rName = if ($_.name) { $_.name } elseif ($_.properties.resourceName) { $_.properties.resourceName } else { $_.properties.name.value }
-                    $rName -and ($CpuFamilies -contains $rName)
+                    $rName -and ($CpuFamilies -icontains $rName)
                 })
 
                 if ($relevantLimits.Count -gt 0) {
@@ -1170,9 +1189,13 @@ Write-Host "Resolved $($resolvedFamilies.Count) family/families: $($resolvedFami
 
 # ── Prepare output directory ────────────────────────────────────────────────────
 $outputDir = Join-Path $PSScriptRoot "output"
-if (-not (Test-Path $outputDir)) {
-    New-Item -ItemType Directory -Path $outputDir | Out-Null
-    Write-Host "`nCreated output directory: $outputDir"
+try {
+    if (-not (Test-Path $outputDir)) {
+        New-Item -ItemType Directory -Path $outputDir -ErrorAction Stop | Out-Null
+        Write-Host "`nCreated output directory: $outputDir"
+    }
+} catch {
+    throw "Failed to create output directory '$outputDir': $($_.Exception.Message)"
 }
 
 $timestamp      = $scriptStart.ToString("yyyyMMdd")
@@ -1226,7 +1249,11 @@ $markdownContent = New-MarkdownReport `
     -GeneratedAt  $scriptStart `
     -GroupDetails $groupDetails
 
-$markdownContent | Out-File -FilePath $reportPath -Encoding UTF8 -Force
+try {
+    $markdownContent | Out-File -FilePath $reportPath -Encoding UTF8 -Force -ErrorAction Stop
+} catch {
+    throw "Failed to write report to '$reportPath': $($_.Exception.Message)"
+}
 
 # ── Summary ─────────────────────────────────────────────────────────────────────
 $totalElapsed = [math]::Round(((Get-Date) - $scriptStart).TotalSeconds, 1)
