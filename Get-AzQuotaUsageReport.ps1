@@ -512,14 +512,12 @@ function Get-QuotaGroupDetails {
                     GroupName        = $grp.GroupName
                     GroupDisplayName = $grp.GroupDisplayName
                     GroupType        = $grp.GroupType
-                    MemberSubIds     = [System.Collections.Generic.List[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    MemberSubIds     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
                     GroupLimits      = $null
                     GroupAllocations = $null
                 }
             }
-            if (-not $groups[$key].MemberSubIds.Contains($subId)) {
-                $groups[$key].MemberSubIds.Add($subId)
-            }
+            $groups[$key].MemberSubIds.Add($subId) | Out-Null
         }
     }
 
