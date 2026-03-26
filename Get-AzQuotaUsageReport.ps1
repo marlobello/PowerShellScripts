@@ -244,14 +244,11 @@ function Resolve-CpuFamilies {
       Get-AzQuotaUsage — returns current usage per named resource
 
     Both cmdlets target the same scope and are merged by NameValue so callers get
-    a complete object with both Limit, CurrentValue, and ShareableQuota.
+    a complete object with both Limit and CurrentValue.
 
-    ShareableQuota is fetched via a supplementary Invoke-AzRest call because the
-    Az.Quota module's LimitObject class does not expose this field even though the
-    underlying REST API returns it under properties.limit.sharableQuota when a
-    subscription has limitType = "Shared" (i.e., it is a member of a quota group
-    with allocated group quota). For independent subscriptions the field is absent
-    and ShareableQuota is returned as null.
+    Note: shareableQuota is NOT collected here. It is only meaningful in the context
+    of a specific quota group and is fetched per-subscription per-group by
+    Get-QuotaGroupDetails using the quotaAllocations endpoint.
 
     Returns an empty array if both module cmdlets return no entries.
 
@@ -265,9 +262,8 @@ function Resolve-CpuFamilies {
     Base URL of the Azure Resource Manager endpoint for the current cloud.
 
 .OUTPUTS
-    Array of PSCustomObjects with Value, LocalizedValue, CurrentValue, Limit, and
-    ShareableQuota (int or null). Returns empty array on failure or when the
-    subscription has no compute quota in the region.
+    Array of PSCustomObjects with Value, LocalizedValue, CurrentValue, and Limit.
+    Returns empty array on failure or when the subscription has no compute quota.
 #>
 function Get-QuotaFromModule {
     param (
@@ -295,20 +291,6 @@ function Get-QuotaFromModule {
             }
         }
 
-        # Fetch sharableQuota via REST — the Az.Quota module's LimitObject does not
-        # expose this field. It appears under properties.limit.sharableQuota only when
-        # limitType == "Shared" (subscription is in a quota group with allocated quota).
-        $sharableLookup = @{}
-        $sqUri  = "{0}{1}/providers/Microsoft.Quota/quotas?api-version=2024-12-18-preview" -f $ResourceManagerUrl, $scope
-        $sqResp = Invoke-AzRest -Method GET -Uri $sqUri -ErrorAction SilentlyContinue
-        if ($sqResp -and $sqResp.StatusCode -eq 200) {
-            foreach ($entry in ($sqResp.Content | ConvertFrom-Json).value) {
-                if ($null -ne $entry.properties.limit.sharableQuota) {
-                    $sharableLookup[$entry.name] = [int]$entry.properties.limit.sharableQuota
-                }
-            }
-        }
-
         $result = foreach ($entry in $quotaEntries) {
             if ([string]::IsNullOrEmpty($entry.NameValue)) { continue }
 
@@ -317,7 +299,6 @@ function Get-QuotaFromModule {
                 LocalizedValue = $entry.NameLocalizedValue
                 CurrentValue   = if ($usageLookup.ContainsKey($entry.NameValue)) { $usageLookup[$entry.NameValue] } else { 0 }
                 Limit          = if ($null -ne $entry.Limit -and $null -ne $entry.Limit.Value) { [int]$entry.Limit.Value } else { 0 }
-                ShareableQuota = if ($sharableLookup.ContainsKey($entry.NameValue)) { $sharableLookup[$entry.NameValue] } else { $null }
             }
         }
 
@@ -531,20 +512,21 @@ function Get-QuotaGroupDetails {
             $key = "$($grp.ManagementGroup)|$($grp.GroupName)"
             if (-not $groups.ContainsKey($key)) {
                 $groups[$key] = [PSCustomObject]@{
-                    ManagementGroup  = $grp.ManagementGroup
-                    GroupName        = $grp.GroupName
-                    GroupDisplayName = $grp.GroupDisplayName
-                    GroupType        = $grp.GroupType
-                    MemberSubIds     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                    GroupLimits      = $null
-                    GroupAllocations = $null
+                    ManagementGroup        = $grp.ManagementGroup
+                    GroupName              = $grp.GroupName
+                    GroupDisplayName       = $grp.GroupDisplayName
+                    GroupType              = $grp.GroupType
+                    MemberSubIds           = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    GroupLimits            = $null
+                    GroupAllocations       = $null
+                    SubscriptionAllocations = @{}   # subId.ToLower() -> { resourceName -> shareableQuota }
                 }
             }
             $groups[$key].MemberSubIds.Add($subId) | Out-Null
         }
     }
 
-    # Enrich each group with quota limits and allocations from the GroupQuotas API.
+    # Enrich each group with quota limits, allocations, and per-subscription shareableQuota.
     # NOTE: Az.Quota v0.1.3 has no GroupQuota cmdlets (Get-AzQuotaGroupQuotaLimit etc.)
     # are not yet published. Invoke-AzRest is the only available interface today.
     foreach ($key in $groups.Keys) {
@@ -559,6 +541,25 @@ function Get-QuotaGroupDetails {
         $allocResp = Invoke-AzRest -Method GET -Uri "$base/quotaAllocations?api-version=2023-06-01-preview" -ErrorAction SilentlyContinue
         if ($allocResp -and $allocResp.StatusCode -eq 200) {
             $g.GroupAllocations = try { ($allocResp.Content | ConvertFrom-Json).value } catch { @() }
+        }
+
+        # Fetch per-subscription shareableQuota using the correct group-context endpoint:
+        # GET {rm}providers/Microsoft.Management/managementGroups/{mg}/subscriptions/{subId}/
+        #        providers/Microsoft.Quota/groupQuotas/{group}/resourceProviders/
+        #        Microsoft.Compute/quotaAllocations/{region}?api-version=2025-03-01
+        # Returns properties.resourceName and properties.shareableQuota per family.
+        foreach ($subId in $g.MemberSubIds) {
+            $subAllocUri  = "{0}providers/Microsoft.Management/managementGroups/{1}/subscriptions/{2}/providers/Microsoft.Quota/groupQuotas/{3}/resourceProviders/Microsoft.Compute/quotaAllocations/{4}?api-version=2025-03-01" -f $ResourceManagerUrl, $g.ManagementGroup, $subId, $g.GroupName, $Region
+            $subAllocResp = Invoke-AzRest -Method GET -Uri $subAllocUri -ErrorAction SilentlyContinue
+            if ($subAllocResp -and $subAllocResp.StatusCode -eq 200) {
+                $subShareable = @{}
+                foreach ($entry in ($subAllocResp.Content | ConvertFrom-Json).value) {
+                    if ($null -ne $entry.properties.shareableQuota) {
+                        $subShareable[$entry.properties.resourceName] = [int]$entry.properties.shareableQuota
+                    }
+                }
+                $g.SubscriptionAllocations[$subId.ToLower()] = $subShareable
+            }
         }
     }
 
@@ -725,7 +726,6 @@ resources
             $utilPct        = if ($coresLimit -gt 0) { [math]::Round(($coresUsed / $coresLimit) * 100, 1) } else { 0 }
             $displayName    = if ($familyFound) { $familyUsage.LocalizedValue } else { $family }
             $quotaStatus    = if (-not $familyFound) { 'NotFound' } elseif ($coresLimit -eq 0) { 'ZeroLimit' } else { 'OK' }
-            $shareableQuota = if ($familyFound -and $null -ne $familyUsage.ShareableQuota) { $familyUsage.ShareableQuota } else { $null }
 
             # Filter SKUs using the resolved canonical API name
             $familySkus  = $allComputeSkus | Where-Object { $_.Family -eq $canonicalFamilyName }
@@ -768,7 +768,6 @@ resources
                 CoresUsed        = $coresUsed
                 CoresLimit       = $coresLimit
                 UtilizationPct   = $utilPct
-                ShareableQuota   = $shareableQuota
                 QuotaStatus      = $quotaStatus
                 SKUDetails       = @($skuDetails)
             }
@@ -965,13 +964,24 @@ function New-MarkdownReport {
 
                     foreach ($row in ($familyRows | Sort-Object SubscriptionName)) {
                         $utilDisplay  = if ($row.UtilizationPct -gt 80) { "⚠️ $($row.UtilizationPct)%" } else { "$($row.UtilizationPct)%" }
-                        $shareDisplay = if ($null -ne $row.ShareableQuota) { $row.ShareableQuota } else { "—" }
+
+                        # Look up shareableQuota from the group's per-subscription allocation data
+                        # (fetched via the quotaAllocations endpoint in Get-QuotaGroupDetails)
+                        $shareableQuota = $null
+                        if ($grp.SubscriptionAllocations -and
+                            $grp.SubscriptionAllocations.ContainsKey($row.SubscriptionId.ToLower())) {
+                            $subAlloc = $grp.SubscriptionAllocations[$row.SubscriptionId.ToLower()]
+                            if ($subAlloc.ContainsKey($row.Family)) {
+                                $shareableQuota = $subAlloc[$row.Family]
+                            }
+                        }
+                        $shareDisplay = if ($null -ne $shareableQuota) { $shareableQuota } else { "—" }
                         $md.Add("| $($row.SubscriptionName) | $($row.CoresUsed) | $($row.CoresLimit) | $utilDisplay | $shareDisplay |")
 
                         $totalUsed  += $row.CoresUsed
                         $totalLimit += $row.CoresLimit
-                        if ($null -ne $row.ShareableQuota) {
-                            $totalShareable = ($null -eq $totalShareable) ? $row.ShareableQuota : ($totalShareable + $row.ShareableQuota)
+                        if ($null -ne $shareableQuota) {
+                            $totalShareable = ($null -eq $totalShareable) ? $shareableQuota : ($totalShareable + $shareableQuota)
                             $anyShareable   = $true
                         }
                     }
