@@ -59,8 +59,10 @@
     Requirements:
       - PowerShell 7.0 or later
       - Az.Accounts, Az.Compute, Az.Resources, Az.ResourceGraph modules
+      - Az.Quota module (installed automatically if missing — requires internet access)
       - Reader access to all target subscriptions
       - Reader access to the Management Group (when using -ManagementGroup)
+      - Management Group Reader access for Quota Group discovery
 
     Output file: ./output/QuotaReport_{region}_{yyyyMMdd}.md
 #>
@@ -233,21 +235,21 @@ function Resolve-CpuFamilies {
 
 <#
 .SYNOPSIS
-    Queries the Microsoft.Quota REST API for VM family quota in a specific subscription
-    and region.
+    Queries the Az.Quota module for VM family quota limits and usage in a specific
+    subscription and region.
 
 .DESCRIPTION
-    The Microsoft.Quota extension API uses the ARM child-provider pattern:
-      {scope}/providers/Microsoft.Quota/quotas   — returns limits only
-      {scope}/providers/Microsoft.Quota/usages   — returns current usage only
+    Uses the Az.Quota PowerShell module cmdlets to retrieve quota data:
+      Get-AzQuota      — returns quota limits per named resource
+      Get-AzQuotaUsage — returns current usage per named resource
 
-    Both endpoints are called and merged by name so callers get a complete object
-    with both Limit and CurrentValue, in the same shape as the Get-AzVMUsage
-    expanded output.
+    Both cmdlets target the same scope and are merged by NameValue so callers get
+    a complete object with both Limit and CurrentValue, in the same shape as the
+    Get-AzVMUsage expanded output.
 
-    Key difference from Get-AzVMUsage: name/localizedValue live under
-    properties.name.value / properties.name.localizedValue (not at root).
-    The outer entry.name is a plain string (the resource name), not an object.
+    Returns an empty array if both cmdlets return no entries (e.g. Microsoft.Quota
+    is not available in the environment). The caller is responsible for falling back
+    to Get-AzVMUsage in that case.
 
 .PARAMETER SubscriptionId
     The Azure subscription ID to query.
@@ -255,53 +257,44 @@ function Resolve-CpuFamilies {
 .PARAMETER Region
     The Azure region to query (e.g. 'eastus').
 
-.PARAMETER ResourceManagerUrl
-    Base URL of the Azure Resource Manager endpoint for the current cloud.
-
 .OUTPUTS
     Array of PSCustomObjects with Value, LocalizedValue, CurrentValue, and Limit —
     same shape as the Get-AzVMUsage expanded output. Returns empty array on failure
     or when the subscription has no compute quota in the region.
 #>
-function Get-QuotaFromApi {
+function Get-QuotaFromModule {
     param (
         [string]$SubscriptionId,
-        [string]$Region,
-        [string]$ResourceManagerUrl
+        [string]$Region
     )
 
     try {
         $scope = "subscriptions/$SubscriptionId/providers/Microsoft.Compute/locations/$Region"
-        $base  = "{0}{1}/providers/Microsoft.Quota" -f $ResourceManagerUrl, $scope
 
-        # Fetch limits and usages from their separate endpoints and merge by name key
-        $quotaResp  = Invoke-AzRest -Method GET -Uri "$base/quotas?api-version=2023-02-01" -ErrorAction SilentlyContinue
-        $usageResp  = Invoke-AzRest -Method GET -Uri "$base/usages?api-version=2023-02-01"  -ErrorAction SilentlyContinue
+        $quotaEntries = Get-AzQuota      -Scope $scope -ErrorAction SilentlyContinue
+        $usageEntries = Get-AzQuotaUsage -Scope $scope -ErrorAction SilentlyContinue
 
-        $quotaEntries = if ($quotaResp.StatusCode -eq 200) { ($quotaResp.Content | ConvertFrom-Json).value } else { @() }
-        $usageEntries = if ($usageResp -and $usageResp.StatusCode -eq 200) { ($usageResp.Content | ConvertFrom-Json).value } else { @() }
+        if ((-not $quotaEntries -or @($quotaEntries).Count -eq 0) -and
+            (-not $usageEntries -or @($usageEntries).Count -eq 0)) {
+            return @()
+        }
 
-        if ($quotaEntries.Count -eq 0) { return @() }
-
-        # Build a usage lookup: outer entry.name (plain string) -> currentValue
+        # Build a usage lookup: NameValue -> UsageValue
         $usageLookup = @{}
         foreach ($u in $usageEntries) {
-            if ($u.name -and $u.properties.usages) {
-                $usageLookup[$u.name] = [int]$u.properties.usages.value
+            if ($u.NameValue) {
+                $usageLookup[$u.NameValue] = [int]$u.UsageValue
             }
         }
 
         $result = foreach ($entry in $quotaEntries) {
-            # Name lives under properties.name (an object), not the root entry.name (a plain string)
-            $nameValue   = $entry.properties.name.value
-            $nameDisplay = $entry.properties.name.localizedValue
-            if ([string]::IsNullOrEmpty($nameValue)) { continue }
+            if ([string]::IsNullOrEmpty($entry.NameValue)) { continue }
 
             [PSCustomObject]@{
-                Value          = $nameValue
-                LocalizedValue = $nameDisplay
-                CurrentValue   = if ($usageLookup.ContainsKey($entry.name)) { $usageLookup[$entry.name] } else { 0 }
-                Limit          = if ($entry.properties.limit) { [int]$entry.properties.limit.value } else { 0 }
+                Value          = $entry.NameValue
+                LocalizedValue = $entry.NameLocalizedValue
+                CurrentValue   = if ($usageLookup.ContainsKey($entry.NameValue)) { $usageLookup[$entry.NameValue] } else { 0 }
+                Limit          = if ($null -ne $entry.Limit -and $null -ne $entry.Limit.Value) { [int]$entry.Limit.Value } else { 0 }
             }
         }
 
@@ -378,6 +371,96 @@ function Get-ZonePeers {
 
 <#
 .SYNOPSIS
+    Discovers Azure Quota Group membership for a set of subscription IDs.
+
+.DESCRIPTION
+    Traverses all management groups accessible to the current identity and queries
+    the Microsoft.Quota GroupQuotas API for each. For every quota group found, the
+    member subscription list is retrieved and cross-referenced against the provided
+    subscription IDs.
+
+    Returns a hashtable keyed by (lowercase) subscription ID, where each value is a
+    list of group membership objects for that subscription. Subscriptions with no
+    group membership have an empty list.
+
+    Note: The GroupQuotas API is in preview (api-version 2023-06-01-preview). If the
+    API is unavailable or returns errors for a management group, that group is skipped
+    gracefully.
+
+.PARAMETER SubscriptionIds
+    Array of subscription IDs to check group membership for.
+
+.PARAMETER ResourceManagerUrl
+    Base URL of the Azure Resource Manager endpoint for the current cloud.
+
+.OUTPUTS
+    Hashtable: subscriptionId (lowercase) -> List of PSCustomObjects, each with
+    ManagementGroup, GroupName, GroupDisplayName, GroupType, and ProvisioningState.
+#>
+function Get-QuotaGroupMembership {
+    param (
+        [string[]]$SubscriptionIds,
+        [string]$ResourceManagerUrl
+    )
+
+    # Initialize result with empty lists for each subscription
+    $membership = @{}
+    foreach ($id in $SubscriptionIds) {
+        $membership[$id.ToLower()] = [System.Collections.Generic.List[object]]::new()
+    }
+
+    try {
+        $managementGroups = Get-AzManagementGroup -ErrorAction SilentlyContinue
+    } catch {
+        Write-Warning "Unable to list management groups for Quota Group discovery: $($_.Exception.Message)"
+        return $membership
+    }
+
+    if (-not $managementGroups) { return $membership }
+
+    foreach ($mg in $managementGroups) {
+        $mgName        = $mg.Name
+        $groupQuotaUri = "{0}providers/Microsoft.Management/managementGroups/{1}/providers/Microsoft.Quota/groupQuotas?api-version=2023-06-01-preview" -f $ResourceManagerUrl, $mgName
+        $groupResp     = Invoke-AzRest -Method GET -Uri $groupQuotaUri -ErrorAction SilentlyContinue
+        if (-not $groupResp -or $groupResp.StatusCode -ne 200) { continue }
+
+        $groups = try { ($groupResp.Content | ConvertFrom-Json).value } catch { @() }
+        if (-not $groups) { continue }
+
+        foreach ($group in $groups) {
+            $groupName   = $group.name
+            $displayName = $group.properties.displayName
+            $groupType   = $group.properties.groupType
+
+            $subsUri  = "{0}providers/Microsoft.Management/managementGroups/{1}/providers/Microsoft.Quota/groupQuotas/{2}/subscriptions?api-version=2023-06-01-preview" -f $ResourceManagerUrl, $mgName, $groupName
+            $subsResp = Invoke-AzRest -Method GET -Uri $subsUri -ErrorAction SilentlyContinue
+            if (-not $subsResp -or $subsResp.StatusCode -ne 200) { continue }
+
+            $members = try { ($subsResp.Content | ConvertFrom-Json).value } catch { @() }
+            foreach ($member in $members) {
+                # The resource name IS the subscription ID in the group quota subscription resource
+                $memberId = $member.name
+                if ([string]::IsNullOrEmpty($memberId)) { continue }
+
+                $key = $memberId.ToLower()
+                if ($membership.ContainsKey($key)) {
+                    $membership[$key].Add([PSCustomObject]@{
+                        ManagementGroup   = $mgName
+                        GroupName         = $groupName
+                        GroupDisplayName  = if ($displayName) { $displayName } else { $groupName }
+                        GroupType         = if ($groupType)   { $groupType   } else { 'Unknown'  }
+                        ProvisioningState = $group.properties.provisioningState
+                    })
+                }
+            }
+        }
+    }
+
+    return $membership
+}
+
+<#
+.SYNOPSIS
     Collects quota usage and availability zone data for a single subscription.
 
 .DESCRIPTION
@@ -387,7 +470,7 @@ function Get-ZonePeers {
       1. Sets the Az context to the subscription
       2. Retrieves logical-to-physical availability zone mappings
       3. Gets compute resource SKUs (filtered to virtualMachines and requested families)
-      4. Gets current VM quota usage via the Microsoft.Quota REST API (Get-AzVMUsage as fallback)
+      4. Gets current VM quota usage via the Az.Quota module (Get-AzVMUsage as fallback)
       5. Joins SKU data to quota data by CPU family
       6. Returns structured objects per family, each containing:
            - Subscription metadata (TenantId, Id, Name)
@@ -432,14 +515,8 @@ function Get-SubscriptionQuotaData {
         # data is available for the subscription.
         #
         # IMPORTANT: Get-AzResourceProvider has no -SubscriptionId parameter and
-        # relies solely on the current Az context. In a parallel runspace another
-        # thread can switch that context between Set-AzContext and the cmdlet call,
-        # silently checking the wrong subscription. We use Invoke-AzRest instead —
+        # relies solely on the current Az context. We use Invoke-AzRest instead —
         # the subscription ID is embedded directly in the URL and is context-independent.
-        #
-        # Microsoft.Quota is NOT checked: it reports NotRegistered even when the
-        # Quota REST API responds correctly (platform-level endpoint). The existing
-        # fallback to Get-AzVMUsage handles any case where the Quota API is unavailable.
         $providerUri   = "{0}subscriptions/{1}/providers/Microsoft.Compute?api-version=2021-04-01" -f $ResourceManagerUrl, $SubscriptionId
         $providerResp  = Invoke-AzRest -Method GET -Uri $providerUri -ErrorAction SilentlyContinue
         $providerState = if ($providerResp -and $providerResp.StatusCode -eq 200) {
@@ -450,6 +527,22 @@ function Get-SubscriptionQuotaData {
             $state = if ($providerState) { $providerState } else { 'unknown' }
             Write-Warning "Skipping subscription '$($subscription.Name)': Microsoft.Compute is not registered (state: '$state'). Register it with: Register-AzResourceProvider -ProviderNamespace Microsoft.Compute"
             return @()
+        }
+
+        # ── Microsoft.Quota registration warning ────────────────────────────────
+        # This is an informational warning only — Microsoft.Quota sometimes reports
+        # NotRegistered even when the Quota REST API responds correctly (it is a
+        # platform-level endpoint, not a per-subscription deployment). We still
+        # attempt the Az.Quota module call and fall back to Get-AzVMUsage if needed.
+        $quotaProvUri   = "{0}subscriptions/{1}/providers/Microsoft.Quota?api-version=2021-04-01" -f $ResourceManagerUrl, $SubscriptionId
+        $quotaProvResp  = Invoke-AzRest -Method GET -Uri $quotaProvUri -ErrorAction SilentlyContinue
+        $quotaProvState = if ($quotaProvResp -and $quotaProvResp.StatusCode -eq 200) {
+            ($quotaProvResp.Content | ConvertFrom-Json).registrationState
+        } else { $null }
+
+        if ($quotaProvState -ne 'Registered') {
+            $state = if ($quotaProvState) { $quotaProvState } else { 'unknown' }
+            Write-Warning "Subscription '$($subscription.Name)': Microsoft.Quota is not registered (state: '$state'). The Az.Quota module may not return data; Get-AzVMUsage will be used as a fallback if needed."
         }
 
         # Get zone mapping (logical → physical) for this subscription + region
@@ -483,11 +576,11 @@ resources
             }
         }
 
-        # Primary quota source: Microsoft.Quota REST API (merges /quotas + /usages for complete data)
-        $quotaApiResults = Get-QuotaFromApi -SubscriptionId $SubscriptionId -Region $Region -ResourceManagerUrl $ResourceManagerUrl
+        # Primary quota source: Az.Quota module (Get-AzQuota for limits + Get-AzQuotaUsage for usage)
+        $quotaApiResults = Get-QuotaFromModule -SubscriptionId $SubscriptionId -Region $Region
 
         # Fallback quota source: classic Compute usage API (Get-AzVMUsage)
-        # Used when the Quota API returns no data (e.g. unsupported environment or transient failure)
+        # Used when the Az.Quota module returns no data (e.g. provider not registered or transient failure)
         $vmUsageExpanded = if ($quotaApiResults.Count -eq 0) {
             Get-AzVMUsage -Location $Region -ErrorAction SilentlyContinue |
                 Select-Object -ExpandProperty Name -Property CurrentValue, Limit
@@ -590,12 +683,14 @@ resources
 
 .DESCRIPTION
     Generates a well-structured Markdown document from the collected quota data.
-    The report has three sections:
+    The report has four sections:
 
-      1. Header — run metadata (timestamp, region, families, subscription count)
+      1. Header — run metadata (timestamp, region, families, subscription count, group count)
       2. Cross-Subscription Summary — one table row per family showing aggregated
          totals across all subscriptions, with a ⚠️ warning for utilization > 80%
-      3. Per-Subscription Detail — one section per subscription, with a heading
+      3. Quota Group Membership — shows which subscriptions belong to Azure Quota
+         Groups; subscriptions not in any group are called out for consideration
+      4. Per-Subscription Detail — one section per subscription, with a heading
          per CPU family showing used/limit, and a table of SKUs with both logical
          and physical zone information side-by-side
 
@@ -611,6 +706,11 @@ resources
 .PARAMETER GeneratedAt
     The datetime the report was generated (used in the header).
 
+.PARAMETER QuotaGroupMembership
+    Hashtable of quota group membership data, keyed by (lowercase) subscription ID,
+    as returned by Get-QuotaGroupMembership. Used to populate the Quota Group
+    Membership section and annotate per-subscription headings.
+
 .OUTPUTS
     A single string containing the complete Markdown document.
 #>
@@ -619,10 +719,27 @@ function New-MarkdownReport {
         [object[]]$Results,
         [string]$Region,
         [string[]]$CpuFamilies,
-        [datetime]$GeneratedAt
+        [datetime]$GeneratedAt,
+        [hashtable]$QuotaGroupMembership = @{}
     )
 
     $md = [System.Collections.Generic.List[string]]::new()
+
+    # Pre-compute subscription list and group lookups used across multiple sections
+    $uniqueSubs = $Results |
+        Group-Object -Property SubscriptionId |
+        ForEach-Object { $_.Group[0] } |
+        Select-Object SubscriptionId, SubscriptionName |
+        Sort-Object SubscriptionName
+
+    $allGroups = @{}
+    if ($QuotaGroupMembership) {
+        foreach ($subGroups in $QuotaGroupMembership.Values) {
+            foreach ($g in $subGroups) {
+                $allGroups["$($g.ManagementGroup)/$($g.GroupName)"] = $g
+            }
+        }
+    }
 
     # ── Header ─────────────────────────────────────────────────────────────────
     $md.Add("# Azure Quota Usage Report")
@@ -632,12 +749,8 @@ function New-MarkdownReport {
     $md.Add("| **Generated** | $($GeneratedAt.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')) UTC |")
     $md.Add("| **Region** | ``$Region`` |")
     $md.Add("| **CPU Families** | $($CpuFamilies -join ', ') |")
-    $uniqueSubs = $Results |
-        Group-Object -Property SubscriptionId |
-        ForEach-Object { $_.Group[0] } |
-        Select-Object SubscriptionId, SubscriptionName |
-        Sort-Object SubscriptionName
     $md.Add("| **Subscriptions Analyzed** | $($uniqueSubs.Count) |")
+    $md.Add("| **Quota Groups Found** | $($allGroups.Count) |")
     $md.Add("")
 
     $md.Add("### Subscriptions Queried")
@@ -682,12 +795,55 @@ function New-MarkdownReport {
     $md.Add("---")
     $md.Add("")
 
+    # ── Quota Group Membership ─────────────────────────────────────────────────
+    $md.Add("## Quota Group Membership")
+    $md.Add("")
+
+    if ($allGroups.Count -eq 0) {
+        $md.Add("No Quota Group memberships were found for the analyzed subscriptions.")
+        $md.Add("")
+        $md.Add("> Consider creating an [Azure Quota Group](https://learn.microsoft.com/azure/quotas/quota-groups) to share quota across subscriptions and reduce the need for individual quota increase requests.")
+    } else {
+        $md.Add("Subscriptions that are members of an Azure Quota Group share a common quota pool, reducing the need to request increases per subscription.")
+        $md.Add("")
+        $md.Add("| Subscription | Group Name | Group Display Name | Management Group | Group Type |")
+        $md.Add("|---|---|---|---|---|")
+
+        $groupedSubs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+        foreach ($sub in $uniqueSubs) {
+            $subKey    = $sub.SubscriptionId.ToLower()
+            $subGroups = if ($QuotaGroupMembership.ContainsKey($subKey)) { @($QuotaGroupMembership[$subKey]) } else { @() }
+            foreach ($grp in $subGroups) {
+                $md.Add("| $($sub.SubscriptionName) (``$($sub.SubscriptionId)``) | $($grp.GroupName) | $($grp.GroupDisplayName) | $($grp.ManagementGroup) | $($grp.GroupType) |")
+                $groupedSubs.Add($sub.SubscriptionId) | Out-Null
+            }
+        }
+
+        $noGroupSubs = @($uniqueSubs | Where-Object { -not $groupedSubs.Contains($_.SubscriptionId) })
+        if ($noGroupSubs.Count -gt 0) {
+            $noGroupNames = ($noGroupSubs | ForEach-Object { "**$($_.SubscriptionName)**" }) -join ", "
+            $md.Add("")
+            $md.Add("> The following subscriptions are not members of any Quota Group: $noGroupNames")
+        }
+    }
+
+    $md.Add("")
+    $md.Add("---")
+    $md.Add("")
+
     # ── Per-Subscription Detail ─────────────────────────────────────────────────
     $md.Add("## Per-Subscription Detail")
     $md.Add("")
 
     foreach ($sub in $uniqueSubs) {
-        $md.Add("### $($sub.SubscriptionName) - ``$($sub.SubscriptionId)``")
+        $subKey        = $sub.SubscriptionId.ToLower()
+        $subGroupNames = if ($QuotaGroupMembership -and $QuotaGroupMembership.ContainsKey($subKey)) {
+            @($QuotaGroupMembership[$subKey] | Select-Object -ExpandProperty GroupName -Unique)
+        } else { @() }
+        $groupBadge = if ($subGroupNames.Count -gt 0) { " *(Quota Groups: $($subGroupNames -join ', '))*" } else { "" }
+
+        $md.Add("### $($sub.SubscriptionName) - ``$($sub.SubscriptionId)``$groupBadge")
         $md.Add("")
 
         $subResults = @($Results | Where-Object { $_.SubscriptionId -eq $sub.SubscriptionId })
@@ -756,6 +912,20 @@ if ($null -eq $azContext -or $null -eq $azContext.Account) {
 }
 Write-Host "Using Azure context: $($azContext.Account.Id) (Tenant: $($azContext.Tenant.TenantId))"
 
+# ── Verify Az.Quota module ───────────────────────────────────────────────────────
+if (-not (Get-Module -Name Az.Quota -ListAvailable)) {
+    Write-Warning "Az.Quota module is not installed."
+    $installAnswer = Read-Host "Install Az.Quota now for the current user? [Y/N]"
+    if ($installAnswer -match '^[Yy]') {
+        Write-Host "Installing Az.Quota..."
+        Install-Module -Name Az.Quota -Scope CurrentUser -Force -ErrorAction Stop
+        Write-Host "Az.Quota installed successfully."
+    } else {
+        throw "Az.Quota module is required. Install it with: Install-Module -Name Az.Quota -Scope CurrentUser"
+    }
+}
+Import-Module Az.Quota -ErrorAction SilentlyContinue
+
 # ── Resolve subscriptions ───────────────────────────────────────────────────────
 Write-Host "`nResolving subscriptions..."
 $mgInput  = if ($PSCmdlet.ParameterSetName -eq 'ByManagementGroup') { @($ManagementGroup) } else { @() }
@@ -812,13 +982,25 @@ if ($allResults.Count -eq 0) {
     Write-Warning "No quota data was collected. Verify the region name and that subscriptions are accessible."
 }
 
+# ── Discover Quota Group memberships ───────────────────────────────────────────
+Write-Host "`nDiscovering Quota Group memberships..."
+$groupMembership = Get-QuotaGroupMembership `
+    -SubscriptionIds    $resolvedSubscriptionIds `
+    -ResourceManagerUrl $resourceManagerUrl
+
+$totalGroupsFound = 0
+foreach ($subGroups in $groupMembership.Values) { $totalGroupsFound += @($subGroups | Select-Object -ExpandProperty GroupName -Unique).Count }
+$distinctGroupCount = ($groupMembership.Values | ForEach-Object { $_ } | Select-Object ManagementGroup, GroupName -Unique).Count
+Write-Host "Quota Group memberships discovered: $distinctGroupCount group(s)"
+
 # ── Generate and write Markdown report ─────────────────────────────────────────
 Write-Host "`nGenerating Markdown report..."
 $markdownContent = New-MarkdownReport `
-    -Results     $allResults `
-    -Region      $Region `
-    -CpuFamilies $resolvedFamilies `
-    -GeneratedAt $scriptStart
+    -Results              $allResults `
+    -Region               $Region `
+    -CpuFamilies          $resolvedFamilies `
+    -GeneratedAt          $scriptStart `
+    -QuotaGroupMembership $groupMembership
 
 $markdownContent | Out-File -FilePath $reportPath -Encoding UTF8 -Force
 
