@@ -65,6 +65,9 @@
       - Management Group Reader access for Quota Group discovery
 
     Output file: ./output/QuotaReport_{region}_{yyyyMMdd}.md (default), or ./output/{OutputFileName}.md if -OutputFileName is supplied.
+
+    Use -IncludeSubscriptionDetails to add per-SKU zone and restriction data to the report.
+    Without it, only the summary and Quota Group sections are rendered (faster for large environments).
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'BySubscription')]
@@ -86,7 +89,10 @@ param (
     [string]$Region,
 
     [Parameter(Mandatory = $false, HelpMessage = "Optional base name for the output file (no extension). Defaults to 'QuotaReport_{region}_{yyyyMMdd}'. The .md extension is always appended.")]
-    [string]$OutputFileName
+    [string]$OutputFileName,
+
+    [Parameter(Mandatory = $false, HelpMessage = "When specified, collects and renders per-subscription SKU and zone detail in the report. Omit to produce a leaner report with only the summary and Quota Group sections.")]
+    [switch]$IncludeSubscriptionDetails
 )
 
 # ================================================================================
@@ -644,7 +650,8 @@ function Get-SubscriptionQuotaData {
         [string]$SubscriptionId,
         [string]$Region,
         [string[]]$CpuFamilies,
-        [string]$ResourceManagerUrl
+        [string]$ResourceManagerUrl,
+        [switch]$IncludeSkuDetails
     )
 
     $startTime = Get-Date
@@ -691,37 +698,32 @@ function Get-SubscriptionQuotaData {
         }
 
         # Get zone mapping (logical → physical) for this subscription + region
-        $zonePeers = Get-ZonePeers -SubscriptionId $SubscriptionId -Region $Region -ResourceManagerUrl $ResourceManagerUrl
+        # Get zone mapping, SKU data, and VM counts only when the caller wants
+        # per-subscription detail — these are the most expensive calls per subscription.
+        $zoneMap       = @{}
+        $allComputeSkus = @()
+        $vmCountLookup  = @{}
 
-        # Build a fast lookup hashtable: logicalZone string → physicalZone string
-        $zoneMap = @{}
-        foreach ($zp in $zonePeers) {
-            $zoneMap[$zp.LogicalZone] = $zp.PhysicalZone
-        }
+        if ($IncludeSkuDetails) {
+            $zonePeers = Get-ZonePeers -SubscriptionId $SubscriptionId -Region $Region -ResourceManagerUrl $ResourceManagerUrl
+            foreach ($zp in $zonePeers) { $zoneMap[$zp.LogicalZone] = $zp.PhysicalZone }
 
-        # Get all VM SKUs in this region (unfiltered — we filter per-family below once
-        # canonical API names are resolved from the usage data)
-        $allComputeSkus = @(Get-AzComputeResourceSku -Location $Region -ErrorAction SilentlyContinue |
-            Where-Object { $_.ResourceType -eq 'virtualMachines' })
+            $allComputeSkus = @(Get-AzComputeResourceSku -Location $Region -ErrorAction SilentlyContinue |
+                Where-Object { $_.ResourceType -eq 'virtualMachines' })
 
-        if ($allComputeSkus.Count -eq 0) {
-            Write-Warning "No virtualMachine SKUs returned for region '$Region' in subscription '$($subscription.Name)'. Zone and SKU data will be missing."
-        }
+            if ($allComputeSkus.Count -eq 0) {
+                Write-Warning "No virtualMachine SKUs returned for region '$Region' in subscription '$($subscription.Name)'. Zone and SKU data will be missing."
+            }
 
-        # Build a VM instance count lookup: vmSize (lowercase) -> count of deployed VMs in this region.
-        # Uses Azure Resource Graph for a single efficient API call with server-side aggregation,
-        # rather than fetching all VM objects and filtering client-side.
-        $vmCountLookup = @{}
-        $argQuery = @"
+            $argQuery = @"
 resources
 | where type == "microsoft.compute/virtualmachines"
 | where location == "$Region"
 | summarize count = count() by vmSize = tostring(properties.hardwareProfile.vmSize)
 "@
-        $argResults = Search-AzGraph -Query $argQuery -Subscription $SubscriptionId -ErrorAction SilentlyContinue
-        foreach ($row in $argResults) {
-            if ($row.vmSize) {
-                $vmCountLookup[$row.vmSize.ToLower()] = [int]$row.count
+            $argResults = Search-AzGraph -Query $argQuery -Subscription $SubscriptionId -ErrorAction SilentlyContinue
+            foreach ($row in $argResults) {
+                if ($row.vmSize) { $vmCountLookup[$row.vmSize.ToLower()] = [int]$row.count }
             }
         }
 
@@ -876,7 +878,8 @@ function New-MarkdownReport {
         [string[]]$CpuFamilies,
         [datetime]$GeneratedAt,
         [object[]]$GroupDetails = @(),
-        [hashtable]$SubNameLookup = @()
+        [hashtable]$SubNameLookup = @(),
+        [switch]$IncludeSubscriptionDetails
     )
 
     $md = [System.Collections.Generic.List[string]]::new()
@@ -1148,13 +1151,14 @@ function New-MarkdownReport {
     }
 
     # ── Per-Subscription Detail ─────────────────────────────────────────────────
-    $md.Add("## Per-Subscription Detail")
-    $md.Add("")
+    if ($IncludeSubscriptionDetails) {
+        $md.Add("## Per-Subscription Detail")
+        $md.Add("")
 
-    foreach ($sub in $uniqueSubs) {
-        $subKey        = $sub.SubscriptionId.ToLower()
-        $subGroupNames = if ($subToGroupNames.ContainsKey($subKey)) { @($subToGroupNames[$subKey]) } else { @() }
-        $groupBadge    = if ($subGroupNames.Count -gt 0) { " *(Quota Groups: $($subGroupNames -join ', '))*" } else { "" }
+        foreach ($sub in $uniqueSubs) {
+            $subKey        = $sub.SubscriptionId.ToLower()
+            $subGroupNames = if ($subToGroupNames.ContainsKey($subKey)) { @($subToGroupNames[$subKey]) } else { @() }
+            $groupBadge    = if ($subGroupNames.Count -gt 0) { " *(Quota Groups: $($subGroupNames -join ', '))*" } else { "" }
 
         $md.Add("### $($sub.SubscriptionName) - ``$($sub.SubscriptionId)``$groupBadge")
         $md.Add("")
@@ -1204,6 +1208,8 @@ function New-MarkdownReport {
         $md.Add("---")
         $md.Add("")
     }
+
+    } # end if ($IncludeSubscriptionDetails)
 
     return $md -join "`n"
 }
@@ -1294,7 +1300,8 @@ foreach ($subId in $resolvedSubscriptionIds) {
         -SubscriptionId     $subId `
         -Region             $Region `
         -CpuFamilies        $resolvedFamilies `
-        -ResourceManagerUrl $resourceManagerUrl
+        -ResourceManagerUrl $resourceManagerUrl `
+        -IncludeSkuDetails:$IncludeSubscriptionDetails
     foreach ($r in $subResults) { $allResults.Add($r) }
 }
 
@@ -1339,12 +1346,13 @@ foreach ($grp in $groupDetails) {
 # ── Generate and write Markdown report ─────────────────────────────────────────
 Write-Host "`nGenerating Markdown report..."
 $markdownContent = New-MarkdownReport `
-    -Results             $allResults `
-    -Region              $Region `
-    -CpuFamilies         $resolvedFamilies `
-    -GeneratedAt         $scriptStart `
-    -GroupDetails        $groupDetails `
-    -SubNameLookup       $subNameLookup
+    -Results                    $allResults `
+    -Region                     $Region `
+    -CpuFamilies                $resolvedFamilies `
+    -GeneratedAt                $scriptStart `
+    -GroupDetails               $groupDetails `
+    -SubNameLookup              $subNameLookup `
+    -IncludeSubscriptionDetails:$IncludeSubscriptionDetails
 
 try {
     $markdownContent | Out-File -FilePath $reportPath -Encoding UTF8 -Force -ErrorAction Stop
