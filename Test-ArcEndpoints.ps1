@@ -160,8 +160,8 @@ if ($shard) {
 # Region-specific endpoint for Arc-enabled SQL Server (*.<region>.arcdataservices.com)
 if ($IncludeSqlArc) {
     $endpoints += [pscustomobject]@{
-        Host    = "telemetry.$Region.arcdataservices.com"
-        Purpose = "Arc-enabled SQL Server data/telemetry (*.$Region.arcdataservices.com)"
+        Host    = "telemetry.$regionLower.arcdataservices.com"
+        Purpose = "Arc-enabled SQL Server data/telemetry (*.$regionLower.arcdataservices.com)"
     }
     $endpoints += [pscustomobject]@{
         Host    = 'graph.microsoft.com'
