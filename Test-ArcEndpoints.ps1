@@ -23,8 +23,13 @@
     represented here by a known concrete subdomain that resolves in DNS.
 
 .PARAMETER Region
-    The Azure region short name (e.g. eastus, westeurope) used to build the
-    region-specific endpoints. Defaults to 'eastus'.
+    The Azure region short name (e.g. eastus, westeurope, centralus) used to
+    build the regional endpoints. Defaults to 'eastus'.
+
+.PARAMETER HisShard
+    Override the Hybrid Identity Service (HIS) shard code used to build
+    <shard>.his.arc.azure.com. Required if your region isn't in the built-in
+    map. Examples: eus, scus, weu, sea, kc, ae.
 
 .PARAMETER IncludeSqlArc
     Include endpoints required only for Azure Arc-enabled SQL Server.
@@ -59,6 +64,7 @@
 [CmdletBinding()]
 param(
     [string]$Region = 'eastus',
+    [string]$HisShard,
     [switch]$IncludeSqlArc,
     [switch]$IncludeEsu,
     [switch]$SkipHttps,
@@ -93,6 +99,63 @@ $endpoints = @(
     [pscustomobject]@{ Host = 'www.microsoft.com';                             Purpose = 'Intermediate certificate updates (pkiops/certs)' }
     [pscustomobject]@{ Host = 'dls.microsoft.com';                             Purpose = 'License validation (hotpatching / WS Azure Benefits / PAYG)' }
 )
+
+# Regional Arc endpoints — these are the ones that the azcmagent connectivity
+# test calls out by name (and frequently fail in DNS for misconfigured networks).
+#   <region>-gas.guestconfiguration.azure.com   (region name maps directly)
+#   <shard>.his.arc.azure.com                   (region maps to a short HIS shard code)
+# The HIS shard code is NOT the Azure region name. The mapping below is verified
+# via DNS for the listed regions; for any other region pass -HisShard explicitly.
+$hisShardMap = @{
+    'eastus'             = 'eus'
+    'eastus2'            = 'eus2'
+    'westus2'            = 'wus2'
+    'westcentralus'      = 'wcus'
+    'centralus'          = 'scus'
+    'southcentralus'     = 'scus'
+    'northeurope'        = 'ne'
+    'westeurope'         = 'weu'
+    'uksouth'            = 'uks'
+    'francecentral'      = 'fc'
+    'germanywestcentral' = 'gwc'
+    'swedencentral'      = 'sec'
+    'polandcentral'      = 'plc'
+    'italynorth'         = 'itn'
+    'eastasia'           = 'ea'
+    'southeastasia'      = 'sea'
+    'koreacentral'       = 'kc'
+    'australiaeast'      = 'ae'
+    'brazilsouth'        = 'brs'
+    'southafricanorth'   = 'san'
+    'uaenorth'           = 'uaen'
+    'qatarcentral'       = 'qac'
+    'israelcentral'      = 'ilc'
+    'indonesiacentral'   = 'idc'
+    'malaysiawest'       = 'myw'
+}
+
+$regionLower = $Region.ToLowerInvariant()
+$shard = if ($PSBoundParameters.ContainsKey('HisShard') -and $HisShard) {
+    $HisShard
+} elseif ($hisShardMap.ContainsKey($regionLower)) {
+    $hisShardMap[$regionLower]
+} else {
+    $null
+}
+
+$endpoints += [pscustomobject]@{
+    Host    = "$regionLower-gas.guestconfiguration.azure.com"
+    Purpose = "Guest Configuration agent service (regional, <region>-gas.guestconfiguration.azure.com)"
+}
+
+if ($shard) {
+    $endpoints += [pscustomobject]@{
+        Host    = "$shard.his.arc.azure.com"
+        Purpose = "Hybrid Identity Service (regional shard '$shard' for $regionLower)"
+    }
+} else {
+    Write-Warning ("No HIS shard code is mapped for region '{0}'. The agent will require <shard>.his.arc.azure.com; pass -HisShard <code> to test it." -f $regionLower)
+}
 
 # Region-specific endpoint for Arc-enabled SQL Server (*.<region>.arcdataservices.com)
 if ($IncludeSqlArc) {
