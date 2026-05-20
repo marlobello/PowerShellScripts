@@ -4,17 +4,23 @@
     required by Azure Arc-enabled servers.
 
 .DESCRIPTION
-    Uses Test-NetConnection on TCP port 443 (HTTPS) against the public endpoints
-    documented for Azure Arc-enabled servers. Outputs a result object per
-    endpoint and a summary at the end.
+    Performs three layered checks against each documented endpoint:
+      1. DNS resolution (Resolve-DnsName)
+      2. TCP/443 reachability (Test-NetConnection)
+      3. HTTPS probe with TLS + SNI + certificate validation (Invoke-WebRequest)
+
+    Step 3 catches problems Test-NetConnection cannot, including TLS-intercepting
+    proxies, untrusted certificates, disabled TLS versions, missing cipher
+    suites, and SNI-based firewall filtering. Any HTTP response (including 4xx)
+    is treated as success because it proves the TLS + HTTP stack works; only
+    transport, TLS, or DNS failures are reported as errors.
 
     Endpoint list is taken from the official Microsoft documentation:
     https://learn.microsoft.com/azure/azure-arc/servers/network-requirements
 
     Wildcard endpoints in the docs (e.g. *.his.arc.azure.com,
     *.guestconfiguration.azure.com, *.<region>.arcdataservices.com) are
-    represented here by a known concrete subdomain that resolves in DNS so the
-    TCP test is meaningful.
+    represented here by a known concrete subdomain that resolves in DNS.
 
 .PARAMETER Region
     The Azure region short name (e.g. eastus, westeurope) used to build the
@@ -26,11 +32,20 @@
 .PARAMETER IncludeEsu
     Include endpoints required only for Extended Security Updates (ESU).
 
+.PARAMETER SkipHttps
+    Skip the HTTPS/TLS layer probe and only perform DNS + TCP checks.
+
+.PARAMETER TimeoutSec
+    Timeout in seconds for the HTTPS probe. Defaults to 15.
+
 .EXAMPLE
     .\Test-ArcEndpoints.ps1 -Region westeurope
 
 .EXAMPLE
     .\Test-ArcEndpoints.ps1 -Region eastus2 -IncludeSqlArc -IncludeEsu
+
+.EXAMPLE
+    .\Test-ArcEndpoints.ps1 -SkipHttps   # TCP-only, faster/lighter
 
 .NOTES
     Run from the machine you intend to onboard to Azure Arc.
@@ -45,8 +60,18 @@
 param(
     [string]$Region = 'eastus',
     [switch]$IncludeSqlArc,
-    [switch]$IncludeEsu
+    [switch]$IncludeEsu,
+    [switch]$SkipHttps,
+    [int]$TimeoutSec = 15
 )
+
+# Force TLS 1.2/1.3 for the HTTPS probe so older defaults don't mask issues.
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+} catch {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
@@ -96,30 +121,76 @@ Write-Host ('-' * 80)
 $results = foreach ($ep in $endpoints) {
     Write-Host ("Testing {0,-55} ... " -f $ep.Host) -NoNewline
 
-    $dnsOk    = $false
-    $tcpOk    = $false
-    $remoteIp = $null
+    $dnsOk     = $false
+    $tcpOk     = $false
+    $httpsOk   = $false
+    $remoteIp  = $null
+    $httpCode  = $null
+    $errorMsg  = $null
 
+    # 1) DNS
     try {
-        $null     = Resolve-DnsName -Name $ep.Host -Type A -ErrorAction Stop -QuickTimeout
-        $dnsOk    = $true
+        $null  = Resolve-DnsName -Name $ep.Host -Type A -ErrorAction Stop -QuickTimeout
+        $dnsOk = $true
     } catch {
-        $dnsOk = $false
+        $errorMsg = "DNS: $($_.Exception.Message)"
     }
 
+    # 2) TCP/443
     if ($dnsOk) {
         try {
             $tnc      = Test-NetConnection -ComputerName $ep.Host -Port $Port -WarningAction SilentlyContinue
             $tcpOk    = [bool]$tnc.TcpTestSucceeded
             $remoteIp = if ($tnc.RemoteAddress) { $tnc.RemoteAddress.IPAddressToString } else { $null }
+            if (-not $tcpOk) { $errorMsg = 'TCP: connection refused or timed out' }
         } catch {
-            $tcpOk = $false
+            $errorMsg = "TCP: $($_.Exception.Message)"
         }
     }
 
-    if ($tcpOk)        { Write-Host 'OK'        -ForegroundColor Green }
-    elseif (-not $dnsOk) { Write-Host 'DNS FAIL' -ForegroundColor Red }
-    else               { Write-Host 'TCP FAIL'  -ForegroundColor Red }
+    # 3) HTTPS / TLS / cert / SNI
+    if ($tcpOk -and -not $SkipHttps) {
+        $url = "https://$($ep.Host)/"
+
+        # Try HEAD first; some servers (e.g. download.microsoft.com) reject HEAD
+        # at the transport layer, so fall back to a small GET. Either way, any
+        # HTTP response (incl. 4xx/5xx) means TLS + HTTP succeeded.
+        foreach ($method in 'Head','Get') {
+            try {
+                $resp     = Invoke-WebRequest -Uri $url -Method $method -UseBasicParsing `
+                                              -TimeoutSec $TimeoutSec -MaximumRedirection 0 `
+                                              -ErrorAction Stop
+                $httpsOk  = $true
+                $httpCode = [int]$resp.StatusCode
+                $errorMsg = $null
+                break
+            } catch {
+                # PS 5.1 throws WebException; PS 7+ throws HttpResponseException.
+                # Both expose a .Response with .StatusCode when an HTTP reply was received.
+                $ex   = $_.Exception
+                $code = $null
+                if ($ex.PSObject.Properties['Response'] -and $ex.Response) {
+                    try { $code = [int]$ex.Response.StatusCode } catch { $code = $null }
+                }
+                if ($code) {
+                    $httpsOk  = $true
+                    $httpCode = $code
+                    $errorMsg = $null
+                    break
+                } else {
+                    $errorMsg = "HTTPS ($method): $($ex.Message)"
+                    # try next method
+                }
+            }
+        }
+    }
+
+    $succeeded = if ($SkipHttps) { $tcpOk } else { $tcpOk -and $httpsOk }
+
+    if ($succeeded)        { Write-Host 'OK'       -ForegroundColor Green }
+    elseif (-not $dnsOk)   { Write-Host 'DNS FAIL' -ForegroundColor Red }
+    elseif (-not $tcpOk)   { Write-Host 'TCP FAIL' -ForegroundColor Red }
+    else                   { Write-Host 'TLS FAIL' -ForegroundColor Red }
 
     [pscustomobject]@{
         Endpoint      = $ep.Host
@@ -127,19 +198,31 @@ $results = foreach ($ep in $endpoints) {
         Port          = $Port
         DnsResolved   = $dnsOk
         RemoteAddress = $remoteIp
-        Succeeded     = $tcpOk
+        TcpOk         = $tcpOk
+        HttpsOk       = if ($SkipHttps) { $null } else { $httpsOk }
+        HttpStatus    = $httpCode
+        Succeeded     = $succeeded
+        Error         = $errorMsg
     }
 }
 
 Write-Host ('-' * 80)
-$results | Format-Table Endpoint, Port, DnsResolved, RemoteAddress, Succeeded, Purpose -AutoSize | Out-Host
+$cols = @('Endpoint','DnsResolved','TcpOk')
+if (-not $SkipHttps) { $cols += @('HttpsOk','HttpStatus') }
+$cols += @('Succeeded','Purpose')
+$results | Format-Table $cols -AutoSize | Out-Host
 
 $failed = $results | Where-Object { -not $_.Succeeded }
 if ($failed) {
     Write-Host ("{0} of {1} endpoints FAILED:" -f $failed.Count, $results.Count) -ForegroundColor Red
-    $failed | ForEach-Object { Write-Host (" - {0}  ({1})" -f $_.Endpoint, $_.Purpose) -ForegroundColor Red }
+    $failed | ForEach-Object {
+        $line = " - {0}  ({1})" -f $_.Endpoint, $_.Purpose
+        if ($_.Error) { $line += "  [{0}]" -f $_.Error }
+        Write-Host $line -ForegroundColor Red
+    }
     exit 1
 } else {
-    Write-Host ("All {0} endpoints reachable on TCP/{1}." -f $results.Count, $Port) -ForegroundColor Green
+    $layer = if ($SkipHttps) { "TCP/$Port" } else { "TCP/$Port + HTTPS" }
+    Write-Host ("All {0} endpoints reachable ({1})." -f $results.Count, $layer) -ForegroundColor Green
     exit 0
 }
