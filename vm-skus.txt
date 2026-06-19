@@ -1,0 +1,14 @@
+Standard_D8as_v5
+Standard_E4as_v5
+Standard_D2s_v3
+Standard_D4s_v5
+Standard_D2s_v5
+Standard_B1ms
+Standard_B4as_v2
+Standard_E16ds_v5
+Standard_E16as_v5
+Standard_D8as_v4
+Standard_D8s_v5
+Standard_D16s_v5
+Standard_E64-32ds_v5
+Standard_E32-16ds_v5
