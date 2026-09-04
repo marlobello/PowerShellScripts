@@ -336,12 +336,19 @@ try {
 } catch {
     if ($_.Exception.Message -match 'not supported on this platform') { $firmware = 'BIOS' }
 }
-$nvme = Get-Service -Name 'stornvme' -ErrorAction SilentlyContinue
+$nvmeDriverPath = Join-Path $env:SystemRoot 'System32\drivers\stornvme.sys'
+$nvmeStart = Get-ItemPropertyValue `
+    -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\stornvme' `
+    -Name Start `
+    -ErrorAction SilentlyContinue
 $payload = [ordered]@{
     architecture = $env:PROCESSOR_ARCHITECTURE
     osVersion = [System.Environment]::OSVersion.VersionString
     firmware = $firmware
-    nvmeDriverPresent = ($null -ne $nvme)
+    nvmeDriverPresent = (Test-Path $nvmeDriverPath)
+    nvmeBootReady = ((Test-Path $nvmeDriverPath) -and $nvmeStart -eq 0)
+    fstabUsesStableNames = $null
+    nvmeIoTimeoutConfigured = $null
     azureAgentPresent = ($null -ne (Get-Service -Name 'WindowsAzureGuestAgent' -ErrorAction SilentlyContinue))
 }
 Write-Output ('AZSKU_GUEST_JSON=' + ($payload | ConvertTo-Json -Compress))
@@ -352,9 +359,56 @@ Write-Output ('AZSKU_GUEST_JSON=' + ($payload | ConvertTo-Json -Compress))
 arch="$(uname -m 2>/dev/null)"
 kernel="$(uname -r 2>/dev/null)"
 if [ -d /sys/firmware/efi ]; then firmware="UEFI"; else firmware="BIOS"; fi
-if modinfo nvme >/dev/null 2>&1 || [ -d /sys/module/nvme ]; then nvme=true; else nvme=false; fi
+if { modinfo nvme >/dev/null 2>&1 && modinfo nvme_core >/dev/null 2>&1; } || { [ -d /sys/module/nvme ] && [ -d /sys/module/nvme_core ]; }; then
+    nvme=true
+else
+    nvme=false
+fi
+
+nvme_boot=null
+modules_builtin="/lib/modules/$kernel/modules.builtin"
+if [ -f "$modules_builtin" ] &&
+   grep -Eq 'drivers/nvme/host/nvme\.ko' "$modules_builtin" &&
+   grep -Eq 'drivers/nvme/host/nvme[-_]core\.ko' "$modules_builtin"; then
+    nvme_boot=true
+else
+    initramfs=""
+    for candidate in "/boot/initrd.img-$kernel" "/boot/initramfs-$kernel.img" "/boot/initramfs-$kernel"; do
+        if [ -f "$candidate" ]; then initramfs="$candidate"; break; fi
+    done
+    if [ -n "$initramfs" ] && command -v lsinitramfs >/dev/null 2>&1; then
+        if lsinitramfs "$initramfs" 2>/dev/null | grep -Eq 'drivers/nvme/host/nvme\.ko' &&
+           lsinitramfs "$initramfs" 2>/dev/null | grep -Eq 'drivers/nvme/host/nvme[-_]core\.ko'; then
+            nvme_boot=true
+        else
+            nvme_boot=false
+        fi
+    elif [ -n "$initramfs" ] && command -v lsinitrd >/dev/null 2>&1; then
+        if lsinitrd "$initramfs" 2>/dev/null | grep -Eq 'drivers/nvme/host/nvme\.ko' &&
+           lsinitrd "$initramfs" 2>/dev/null | grep -Eq 'drivers/nvme/host/nvme[-_]core\.ko'; then
+            nvme_boot=true
+        else
+            nvme_boot=false
+        fi
+    fi
+fi
+
+if [ -f /etc/fstab ] && awk '$1 !~ /^#/ && $1 ~ "^/dev/(sd|vd|xvd)[a-z]" { found=1 } END { exit found ? 0 : 1 }' /etc/fstab; then
+    stable_fstab=false
+else
+    stable_fstab=true
+fi
+
+if { [ -r /sys/module/nvme_core/parameters/io_timeout ] &&
+     [ "$(cat /sys/module/nvme_core/parameters/io_timeout 2>/dev/null)" = "240" ]; } ||
+   grep -RqsE '^[[:space:]]*options[[:space:]]+nvme_core[[:space:]].*io_timeout=240([[:space:]]|$)' /etc/modprobe.d 2>/dev/null; then
+    nvme_timeout=true
+else
+    nvme_timeout=false
+fi
+
 if command -v waagent >/dev/null 2>&1 || systemctl list-unit-files 2>/dev/null | grep -q waagent; then agent=true; else agent=false; fi
-printf 'AZSKU_GUEST_JSON={"architecture":"%s","osVersion":"%s","firmware":"%s","nvmeDriverPresent":%s,"azureAgentPresent":%s}\n' "$arch" "$kernel" "$firmware" "$nvme" "$agent"
+printf 'AZSKU_GUEST_JSON={"architecture":"%s","osVersion":"%s","firmware":"%s","nvmeDriverPresent":%s,"nvmeBootReady":%s,"fstabUsesStableNames":%s,"nvmeIoTimeoutConfigured":%s,"azureAgentPresent":%s}\n' "$arch" "$kernel" "$firmware" "$nvme" "$nvme_boot" "$stable_fstab" "$nvme_timeout" "$agent"
 '@
         $commandId = 'RunShellScript'
     }
@@ -549,11 +603,41 @@ function Get-CandidateAssessment {
     $targetControllers = Get-CapabilityValue -Map $target -Name 'DiskControllerTypes'
     $targetControllerList = @($targetControllers -split '\s*,\s*')
     if ($currentController -and $targetControllers -and $currentController -notin $targetControllerList) {
-        if ($targetControllers -match '(?i)NVMe' -and
-            $GuestReadiness.Status -eq 'Succeeded' -and
-            -not $GuestReadiness.Details.nvmeDriverPresent) {
-            $gaps.Add("Target requires '$targetControllers' storage; the guest NVMe driver was not detected")
-            $actions.Add('Install and enable the NVMe driver in the guest OS before resizing, or choose a target that supports the current storage controller.')
+        if ($targetControllers -match '(?i)NVMe' -and $GuestReadiness.Status -eq 'Succeeded') {
+            $nvmePreflightPassed = $true
+            if (-not $GuestReadiness.Details.nvmeDriverPresent) {
+                $nvmePreflightPassed = $false
+                $gaps.Add("Target requires '$targetControllers' storage; the guest NVMe driver was not detected")
+                $actions.Add('Install the NVMe driver in the guest OS before resizing, or choose a target that supports the current storage controller.')
+            } elseif ($GuestReadiness.Details.nvmeBootReady -ne $true) {
+                $nvmePreflightPassed = $false
+                $gaps.Add("Target requires '$targetControllers' storage; the NVMe driver is not confirmed in the boot path")
+                if ($Vm.OsType -eq 'Windows') {
+                    $actions.Add('Configure the Windows stornvme driver for boot start before resizing.')
+                } else {
+                    $actions.Add('Add the nvme and nvme_core modules to the Linux initramfs/initrd, rebuild it, and rerun the assessment.')
+                }
+            }
+
+            if ($Vm.OsType -eq 'Linux') {
+                if ($GuestReadiness.Details.fstabUsesStableNames -eq $false) {
+                    $nvmePreflightPassed = $false
+                    $gaps.Add('/etc/fstab uses a mutable SCSI-style device path')
+                    $actions.Add('Replace /dev/sd*, /dev/vd*, or /dev/xvd* entries in /etc/fstab with UUIDs or /dev/disk/azure paths before resizing.')
+                }
+                if ($GuestReadiness.Details.nvmeIoTimeoutConfigured -eq $false) {
+                    $warnings.Add('nvme_core.io_timeout=240 is not configured')
+                    $actions.Add('Configure nvme_core io_timeout=240 in /etc/modprobe.d, rebuild initramfs, and rerun the assessment.')
+                }
+            }
+
+            if ($nvmePreflightPassed) {
+                $warnings.Add("Disk controller conversion from '$currentController' to NVMe is required; automated guest preflight checks passed")
+                $actions.Add('Use the Microsoft Azure NVMe Conversion script to change the disk controller to NVMe and resize to the recommended SKU.')
+            }
+        } elseif ($targetControllers -match '(?i)NVMe') {
+            $warnings.Add("NVMe boot readiness could not be verified because the guest check did not succeed")
+            $actions.Add('Run the guest readiness check successfully before changing the disk controller to NVMe.')
         } else {
             $warnings.Add("Storage controller changes from '$currentController' to '$targetControllers'; validate OS/image support")
             $actions.Add("Confirm that the OS image supports '$targetControllers' and install/enable the required storage driver before resizing.")
