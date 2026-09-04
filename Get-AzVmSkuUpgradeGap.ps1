@@ -272,6 +272,19 @@ function Get-SkuSeries {
     return $prefix
 }
 
+function ConvertTo-GenerationName {
+    [CmdletBinding()]
+    param (
+        [string]$Value
+    )
+
+    switch -Regex ($Value) {
+        '^(?i:V1|Gen1|Generation1)$' { return 'Gen1' }
+        '^(?i:V2|Gen2|Generation2)$' { return 'Gen2' }
+        default                      { return 'Unknown' }
+    }
+}
+
 function Test-SkuRestricted {
     [CmdletBinding()]
     param (
@@ -451,6 +464,12 @@ function ConvertTo-VmReportObject {
         [object]$VmModel
     )
 
+    $generationValue = if ($VmModel -and $VmModel.HyperVGeneration) {
+        $VmModel.HyperVGeneration
+    } else {
+        $Vm.HyperVGeneration
+    }
+
     return [pscustomobject]@{
         Id                    = $Vm.id
         Name                  = $Vm.name
@@ -458,6 +477,7 @@ function ConvertTo-VmReportObject {
         Location              = $Vm.location
         Zone                  = $Vm.Zone
         OsType                = $Vm.OsType
+        Generation            = ConvertTo-GenerationName -Value $generationValue
         CurrentSku            = $Vm.VmSize
         Series                = Get-SkuSeries -SkuName $Vm.VmSize
         PowerState            = $Vm.PowerState
@@ -602,8 +622,25 @@ function Get-CandidateAssessment {
     $currentController = [string]$Vm.DiskControllerType
     $targetControllers = Get-CapabilityValue -Map $target -Name 'DiskControllerTypes'
     $targetControllerList = @($targetControllers -split '\s*,\s*')
+    $currentGeneration = ConvertTo-GenerationName -Value $VmModel.HyperVGeneration
+    $targetGenerations = Get-CapabilityValue -Map $target -Name 'HyperVGenerations'
+
+    if ($currentGeneration -eq 'Gen1' -and $targetGenerations -and $targetGenerations -notmatch 'V1') {
+        $gaps.Add("Gen1 VM is incompatible with target Hyper-V generations '$targetGenerations'")
+        $actions.Add('Migrate or rebuild the VM as Gen2 before selecting a Gen2-only target SKU.')
+    } elseif ($currentGeneration -eq 'Gen2' -and $targetGenerations -and $targetGenerations -notmatch 'V2') {
+        $gaps.Add("Gen2 VM is incompatible with target Hyper-V generations '$targetGenerations'")
+        $actions.Add('Choose a target SKU that supports Gen2 VMs.')
+    }
+
     if ($currentController -and $targetControllers -and $currentController -notin $targetControllerList) {
-        if ($targetControllers -match '(?i)NVMe' -and $GuestReadiness.Status -eq 'Succeeded') {
+        if ($targetControllers -match '(?i)NVMe' -and $currentGeneration -eq 'Gen1') {
+            $gaps.Add('Gen1 is not eligible for an in-place SCSI-to-NVMe migration')
+            $actions.Add('Migrate or rebuild the VM as Gen2 before moving to an NVMe-only SKU.')
+        } elseif ($targetControllers -match '(?i)NVMe' -and $currentGeneration -eq 'Unknown') {
+            $gaps.Add('VM generation could not be determined; NVMe migration requires confirmed Gen2')
+            $actions.Add('Resolve the VM generation metadata and confirm Gen2 before moving to an NVMe-only SKU.')
+        } elseif ($targetControllers -match '(?i)NVMe' -and $GuestReadiness.Status -eq 'Succeeded') {
             $nvmePreflightPassed = $true
             if (-not $GuestReadiness.Details.nvmeDriverPresent) {
                 $nvmePreflightPassed = $false
@@ -742,6 +779,7 @@ $resourceGroupFilter
     OsType = tostring(properties.storageProfile.osDisk.osType),
     Zone = tostring(zones[0]),
     SecurityType = tostring(properties.securityProfile.securityType),
+    HyperVGeneration = tostring(properties.hyperVGeneration),
     EncryptionAtHost = tobool(properties.securityProfile.encryptionAtHost),
     HibernationEnabled = tobool(properties.additionalCapabilities.hibernationEnabled),
     UltraSsdEnabled = tobool(properties.additionalCapabilities.ultraSSDEnabled),
@@ -945,6 +983,7 @@ $summary = foreach ($detail in $details) {
         Location                = $detail.Vm.Location
         Zone                    = $detail.Vm.Zone
         OsType                  = $detail.Vm.OsType
+        Generation              = $detail.Vm.Generation
         CurrentSku              = $detail.Vm.CurrentSku
         ReadinessStatus         = $detail.ReadinessStatus
         RecommendedTargetSku    = $detail.RecommendedTargetSku
