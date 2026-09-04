@@ -10,8 +10,10 @@
     inspect each VM and execute a guest readiness check, and Azure Compute REST APIs to
     retrieve regional SKU capabilities/restrictions and the VM's direct-resize options.
 
-    Candidate v6/v7 sizes are limited to the VM's current SKU series and must provide at
-    least the current vCPU and memory. The report distinguishes:
+    Candidate v6/v7 sizes must provide at least the current vCPU and memory. Same-series
+    targets are preferred, but the assessment also considers other v6/v7 series so legacy
+    families such as B-series v2 can receive a viable migration recommendation. The report
+    distinguishes:
       - Capability gaps that make a candidate incompatible with the VM configuration.
       - Direct-resize gaps, where the candidate is not currently offered by the VM's
         listAvailableSizes API. Deallocating the VM can expose additional sizes because
@@ -239,6 +241,20 @@ function ConvertTo-Decimal {
     return 0.0
 }
 
+function Get-AvailableVcpuCount {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.Dictionary[string, string]]$CapabilityMap
+    )
+
+    $available = ConvertTo-Decimal (Get-CapabilityValue -Map $CapabilityMap -Name 'vCPUsAvailable')
+    if ($available -gt 0) {
+        return $available
+    }
+    return ConvertTo-Decimal (Get-CapabilityValue -Map $CapabilityMap -Name 'vCPUs')
+}
+
 function Get-SkuSeries {
     [CmdletBinding()]
     param (
@@ -411,6 +427,7 @@ function Get-CandidateAssessment {
         [Parameter(Mandatory = $true)][object]$CurrentSku,
         [Parameter(Mandatory = $true)][object]$CandidateSku,
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.HashSet[string]]$AvailableSizes,
         [Parameter(Mandatory = $true)][object]$GuestReadiness
     )
@@ -419,77 +436,92 @@ function Get-CandidateAssessment {
     $target = ConvertTo-CapabilityMap -Capabilities $CandidateSku.capabilities
     $gaps = [System.Collections.Generic.List[string]]::new()
     $warnings = [System.Collections.Generic.List[string]]::new()
+    $actions = [System.Collections.Generic.List[string]]::new()
 
-    $currentCpus = ConvertTo-Decimal (Get-CapabilityValue -Map $current -Name 'vCPUs')
-    $targetCpus = ConvertTo-Decimal (Get-CapabilityValue -Map $target -Name 'vCPUs')
+    $currentCpus = Get-AvailableVcpuCount -CapabilityMap $current
+    $targetCpus = Get-AvailableVcpuCount -CapabilityMap $target
     $currentMemory = ConvertTo-Decimal (Get-CapabilityValue -Map $current -Name 'MemoryGB')
     $targetMemory = ConvertTo-Decimal (Get-CapabilityValue -Map $target -Name 'MemoryGB')
 
     if ($targetCpus -lt $currentCpus) {
         $gaps.Add("vCPU capacity drops from $currentCpus to $targetCpus")
+        $actions.Add("Choose a target with at least $currentCpus vCPUs.")
     }
     if ($targetMemory -lt $currentMemory) {
         $gaps.Add("Memory drops from $currentMemory GB to $targetMemory GB")
+        $actions.Add("Choose a target with at least $currentMemory GB of memory.")
     }
 
     $dataDiskCount = @($VmModel.StorageProfile.DataDisks).Count
     $targetDataDisks = ConvertTo-Decimal (Get-CapabilityValue -Map $target -Name 'MaxDataDiskCount')
     if ($targetDataDisks -lt $dataDiskCount) {
         $gaps.Add("$dataDiskCount data disks are attached; target supports $targetDataDisks")
+        $actions.Add("Detach or consolidate data disks, or choose a target that supports at least $dataDiskCount data disks.")
     }
 
     $nicCount = @($VmModel.NetworkProfile.NetworkInterfaces).Count
     $targetNics = ConvertTo-Decimal (Get-CapabilityValue -Map $target -Name 'MaxNetworkInterfaces')
     if ($targetNics -lt $nicCount) {
         $gaps.Add("$nicCount NICs are attached; target supports $targetNics")
+        $actions.Add("Remove excess NICs, or choose a target that supports at least $nicCount NICs.")
     }
 
     if ((ConvertTo-Boolean (Get-CapabilityValue -Map $current -Name 'PremiumIO')) -and
         -not (ConvertTo-Boolean (Get-CapabilityValue -Map $target -Name 'PremiumIO'))) {
         $gaps.Add('Current SKU supports Premium Storage but target does not')
+        $actions.Add('Choose a target that supports Premium Storage.')
     }
 
     if ($Vm.AcceleratedNetworking -and
         -not (ConvertTo-Boolean (Get-CapabilityValue -Map $target -Name 'AcceleratedNetworkingEnabled'))) {
         $gaps.Add('Accelerated Networking is enabled but target does not support it')
+        $actions.Add('Choose a target that supports Accelerated Networking, or disable Accelerated Networking on every NIC before resizing.')
     }
 
     if ($Vm.EphemeralOsDisk -and
         -not (ConvertTo-Boolean (Get-CapabilityValue -Map $target -Name 'EphemeralOSDiskSupported'))) {
         $gaps.Add('Ephemeral OS disk is configured but target does not support it')
+        $actions.Add('Choose a target that supports Ephemeral OS disks, or recreate the VM with a managed OS disk.')
     }
 
     if ($Vm.UltraSsdEnabled -and
         -not (ConvertTo-Boolean (Get-CapabilityValue -Map $target -Name 'UltraSSDAvailable'))) {
         $gaps.Add('Ultra Disk compatibility is enabled but target does not support Ultra Disk')
+        $actions.Add('Choose a target that supports Ultra Disk, or detach Ultra Disks and disable Ultra Disk compatibility before resizing.')
     }
 
     if ($Vm.EncryptionAtHost -and
         -not (ConvertTo-Boolean (Get-CapabilityValue -Map $target -Name 'EncryptionAtHostSupported'))) {
         $gaps.Add('Encryption at host is enabled but target does not support it')
+        $actions.Add('Choose a target that supports encryption at host.')
     }
 
     if ($Vm.HibernationEnabled -and
         -not (ConvertTo-Boolean (Get-CapabilityValue -Map $target -Name 'HibernationSupported'))) {
         $gaps.Add('Hibernation is enabled but target does not support it')
+        $actions.Add('Disable hibernation before resizing, or choose a target that supports hibernation.')
     }
 
     if ($Vm.SecurityType -in @('TrustedLaunch', 'ConfidentialVM')) {
         $hyperVGenerations = Get-CapabilityValue -Map $target -Name 'HyperVGenerations'
         if ($hyperVGenerations -notmatch 'V2') {
             $gaps.Add("$($Vm.SecurityType) requires generation 2 support")
+            $actions.Add("Choose a generation 2 target that supports $($Vm.SecurityType).")
         }
         if ($Vm.SecurityType -eq 'TrustedLaunch' -and
             (ConvertTo-Boolean (Get-CapabilityValue -Map $target -Name 'TrustedLaunchDisabled'))) {
             $gaps.Add('Trusted Launch is enabled but disabled for the target SKU')
+            $actions.Add('Choose a target SKU that supports Trusted Launch.')
         }
     }
 
     if (-not (Test-ZoneAvailable -Sku $CandidateSku -Location $Vm.Location -Zone $Vm.Zone)) {
         $gaps.Add("Target is not offered in availability zone $($Vm.Zone)")
+        $actions.Add("Choose a target available in zone $($Vm.Zone), or redeploy the VM into a supported zone.")
     }
     foreach ($restriction in @(Test-SkuRestricted -Sku $CandidateSku -Location $Vm.Location -Zone $Vm.Zone)) {
         $gaps.Add($restriction)
+        $actions.Add('Choose an unrestricted target SKU or request the required SKU access/quota for this subscription and zone.')
     }
 
     $currentArchitecture = Get-CapabilityValue -Map $current -Name 'CpuArchitectureType'
@@ -497,15 +529,20 @@ function Get-CandidateAssessment {
     if ($currentArchitecture -and $targetArchitecture -and
         $currentArchitecture -ne $targetArchitecture) {
         $gaps.Add("Current SKU architecture '$currentArchitecture' is incompatible with target architecture '$targetArchitecture'")
+        $actions.Add("Choose a $currentArchitecture target; changing CPU architecture requires rebuilding the VM with a compatible OS image.")
     } elseif ($GuestReadiness.Status -eq 'Succeeded' -and $targetArchitecture) {
         $guestArchitecture = [string]$GuestReadiness.Details.architecture
         $guestIsArm = $guestArchitecture -match '^(?i:arm64|aarch64)$'
         $targetIsArm = $targetArchitecture -match '^(?i:arm64)$'
         if ($guestIsArm -ne $targetIsArm) {
             $gaps.Add("Guest architecture '$guestArchitecture' is incompatible with target architecture '$targetArchitecture'")
+            $actions.Add("Choose a target compatible with guest architecture '$guestArchitecture'.")
         }
-    } elseif ($targetArchitecture) {
-        $warnings.Add("Guest architecture was not verified; target architecture is $targetArchitecture")
+    }
+
+    if ($GuestReadiness.Status -ne 'Succeeded') {
+        $warnings.Add("Guest readiness was not verified ($($GuestReadiness.Status))")
+        $actions.Add('Start the VM if necessary and rerun the assessment without -SkipGuestCheck to validate guest architecture, Azure agent, and NVMe readiness.')
     }
 
     $currentController = [string]$Vm.DiskControllerType
@@ -516,8 +553,10 @@ function Get-CandidateAssessment {
             $GuestReadiness.Status -eq 'Succeeded' -and
             -not $GuestReadiness.Details.nvmeDriverPresent) {
             $gaps.Add("Target requires '$targetControllers' storage; the guest NVMe driver was not detected")
+            $actions.Add('Install and enable the NVMe driver in the guest OS before resizing, or choose a target that supports the current storage controller.')
         } else {
             $warnings.Add("Storage controller changes from '$currentController' to '$targetControllers'; validate OS/image support")
+            $actions.Add("Confirm that the OS image supports '$targetControllers' and install/enable the required storage driver before resizing.")
         }
     }
 
@@ -525,33 +564,60 @@ function Get-CandidateAssessment {
     $targetTempDisk = ConvertTo-Decimal (Get-CapabilityValue -Map $target -Name 'MaxResourceVolumeMB')
     if ($currentTempDisk -gt 0 -and $targetTempDisk -eq 0) {
         $warnings.Add('Target has no local temporary disk; verify the workload does not depend on temporary-disk data or capacity')
+        $actions.Add('Move required data and workload dependencies off the temporary disk before resizing.')
     }
 
     if ($GuestReadiness.Status -eq 'Succeeded' -and -not $GuestReadiness.Details.azureAgentPresent) {
         $warnings.Add('Azure guest agent was not detected by the in-guest check')
+        $actions.Add('Install or repair the Azure VM agent before the migration.')
     }
 
     $directResize = $AvailableSizes.Contains([string]$CandidateSku.name)
     if (-not $directResize) {
         $warnings.Add('Not currently returned by listAvailableSizes; deallocation, another cluster, quota, or capacity may be required')
+        $actions.Add('Deallocate the VM, confirm regional vCPU-family quota and SKU capacity, then retry the resize.')
     }
 
     $version = if ($CandidateSku.name -match '_v([67])$') { [int]$Matches[1] } else { 99 }
+    $currentSeries = Get-SkuSeries -SkuName $Vm.VmSize
+    $targetSeries = Get-SkuSeries -SkuName $CandidateSku.name
+    $seriesPreference = if ($targetSeries -eq $currentSeries) {
+        0
+    } elseif ($currentSeries -eq 'B' -and $targetSeries -in @('D', 'E', 'F')) {
+        1
+    } else {
+        2
+    }
     $score = ($gaps.Count * 100000) +
-        ($(if ($directResize) { 0 } else { 10000 })) +
+        ($seriesPreference * 10000) +
+        ($(if ($directResize) { 0 } else { 1000 })) +
         ([math]::Max(0, $targetCpus - $currentCpus) * 100) +
         [math]::Max(0, $targetMemory - $currentMemory) +
         $version
 
+    $readinessStatus = if ($gaps.Count -gt 0) {
+        'Blocked'
+    } elseif ($warnings.Count -gt 0) {
+        'ReadyAfterActions'
+    } else {
+        'ReadyToResize'
+    }
+
     return [pscustomobject]@{
         Sku                    = [string]$CandidateSku.name
+        Series                 = $targetSeries
         Version                = $version
         vCPUs                  = $targetCpus
         MemoryGB               = $targetMemory
         DirectResizeAvailable  = $directResize
         Compatible             = ($gaps.Count -eq 0)
+        ReadinessStatus        = $readinessStatus
+        SeriesPreference       = $seriesPreference
+        GapCount               = $gaps.Count
+        WarningCount           = $warnings.Count
         CapabilityGaps         = @($gaps)
         Warnings               = @($warnings)
+        RequiredActions        = @($actions | Sort-Object -Unique)
         Score                  = $score
     }
 }
@@ -631,11 +697,14 @@ foreach ($vm in $vms) {
     $currentSku = $regionSkus | Where-Object { $_.name -eq $vm.VmSize } | Select-Object -First 1
     if (-not $currentSku) {
         $details.Add([pscustomobject]@{
-            Vm                 = ConvertTo-VmReportObject -Vm $vm
-            GuestReadiness     = $null
-            Candidates         = @()
-            NoCandidateReason  = $null
-            AssessmentError    = "Current SKU '$($vm.VmSize)' was not returned by the regional Resource SKUs API."
+            Vm                   = ConvertTo-VmReportObject -Vm $vm
+            ReadinessStatus      = 'AssessmentError'
+            RecommendedTargetSku = $null
+            RequiredActions      = @('Resolve the SKU metadata error and rerun the assessment.')
+            GuestReadiness       = $null
+            Candidates           = @()
+            NoCandidateReason    = $null
+            AssessmentError      = "Current SKU '$($vm.VmSize)' was not returned by the regional Resource SKUs API."
         })
         continue
     }
@@ -667,20 +736,19 @@ foreach ($vm in $vms) {
         }
 
         $currentMap = ConvertTo-CapabilityMap -Capabilities $currentSku.capabilities
-        $currentCpus = ConvertTo-Decimal (Get-CapabilityValue -Map $currentMap -Name 'vCPUs')
+        $currentCpus = Get-AvailableVcpuCount -CapabilityMap $currentMap
         $currentMemory = ConvertTo-Decimal (Get-CapabilityValue -Map $currentMap -Name 'MemoryGB')
         $series = Get-SkuSeries -SkuName $vm.VmSize
 
         $candidateSkus = @(
             $regionSkus | Where-Object {
-                $_.name -match '_v[67]$' -and
-                (Get-SkuSeries -SkuName $_.name) -eq $series
+                $_.name -match '^Standard_[A-Za-z]+\d.*_v[67]$'
             }
         )
 
         $assessments = foreach ($candidateSku in $candidateSkus) {
             $candidateMap = ConvertTo-CapabilityMap -Capabilities $candidateSku.capabilities
-            $candidateCpus = ConvertTo-Decimal (Get-CapabilityValue -Map $candidateMap -Name 'vCPUs')
+            $candidateCpus = Get-AvailableVcpuCount -CapabilityMap $candidateMap
             $candidateMemory = ConvertTo-Decimal (Get-CapabilityValue -Map $candidateMap -Name 'MemoryGB')
             if ($candidateCpus -ge $currentCpus -and $candidateMemory -ge $currentMemory) {
                 Get-CandidateAssessment `
@@ -693,27 +761,67 @@ foreach ($vm in $vms) {
             }
         }
 
-        $ranked = @($assessments | Sort-Object Score, Sku | Select-Object -First $MaxCandidates)
-        $noCandidateReason = if ($ranked.Count -eq 0) {
-            "No same-series v6/v7 SKU with at least $currentCpus vCPUs and $currentMemory GB was found in $($vm.location)."
+        $rankedAll = @(
+            $assessments | Sort-Object `
+                @{ Expression = { if ($_.Compatible) { 0 } else { 1 } } },
+                GapCount,
+                SeriesPreference,
+                @{ Expression = { if ($_.DirectResizeAvailable) { 0 } else { 1 } } },
+                WarningCount,
+                vCPUs,
+                MemoryGB,
+                Version,
+                Sku
+        )
+        $noCandidateReason = if ($rankedAll.Count -eq 0) {
+            "No v6/v7 SKU with at least $currentCpus vCPUs and $currentMemory GB was found in $($vm.location)."
         } else {
             $null
         }
 
+        $recommended = @($rankedAll | Where-Object Compatible | Select-Object -First 1)
+        if ($recommended.Count -eq 0) {
+            $recommended = @($rankedAll | Select-Object -First 1)
+        }
+        $ranked = @($rankedAll | Select-Object -First $MaxCandidates)
+
+        $readinessStatus = if ($noCandidateReason) {
+            'NoTargetFound'
+        } elseif ($recommended.Count -eq 0) {
+            'Blocked'
+        } else {
+            $recommended[0].ReadinessStatus
+        }
+        $requiredActions = if ($noCandidateReason) {
+            @('Review other VM families or regions, or select a v6/v7 target with greater vCPU and memory capacity.')
+        } elseif ($readinessStatus -eq 'ReadyToResize') {
+            @("No remediation is required. Resize the VM to '$($recommended[0].Sku)'.")
+        } elseif ($recommended.Count -gt 0) {
+            @($recommended[0].RequiredActions)
+        } else {
+            @('Review candidate capability gaps and choose a compatible v6/v7 target.')
+        }
+
         $details.Add([pscustomobject]@{
-            Vm              = ConvertTo-VmReportObject -Vm $vm -VmModel $vmModel
-            GuestReadiness  = $guestReadiness
-            Candidates      = $ranked
-            NoCandidateReason = $noCandidateReason
-            AssessmentError = $null
+            Vm                   = ConvertTo-VmReportObject -Vm $vm -VmModel $vmModel
+            ReadinessStatus      = $readinessStatus
+            RecommendedTargetSku = if ($recommended.Count -gt 0) { $recommended[0].Sku } else { $null }
+            RequiredActions      = $requiredActions
+            GuestReadiness       = $guestReadiness
+            Candidates           = $ranked
+            NoCandidateReason    = $noCandidateReason
+            AssessmentError      = $null
         })
     } catch {
         $details.Add([pscustomobject]@{
-            Vm              = ConvertTo-VmReportObject -Vm $vm
-            GuestReadiness  = $null
-            Candidates      = @()
-            NoCandidateReason = $null
-            AssessmentError = $_.Exception.Message
+            Vm                   = ConvertTo-VmReportObject -Vm $vm
+            ReadinessStatus      = 'AssessmentError'
+            RecommendedTargetSku = $null
+            RequiredActions      = @('Resolve the assessment error shown in AssessmentError, then rerun the script.')
+            GuestReadiness       = $null
+            Candidates           = @()
+            NoCandidateReason    = $null
+            AssessmentError      = $_.Exception.Message
         })
     }
 }
@@ -727,10 +835,13 @@ $jsonPath = Join-Path $OutputDirectory "VmSkuUpgradeGaps_$timestamp.json"
 $summary = foreach ($detail in $details) {
     $compatible = @($detail.Candidates | Where-Object Compatible)
     $direct = @($compatible | Where-Object DirectResizeAvailable)
-    $gapCandidates = if ($compatible.Count -gt 0) { @() } else { @($detail.Candidates) }
-    $warningCandidates = if ($compatible.Count -gt 0) { $compatible } else { @($detail.Candidates) }
+    $recommendedCandidate = @(
+        $detail.Candidates |
+            Where-Object Sku -eq $detail.RecommendedTargetSku |
+            Select-Object -First 1
+    )
     $allGaps = @(
-        $gapCandidates.CapabilityGaps |
+        $recommendedCandidate.CapabilityGaps |
             ForEach-Object { $_ } |
             Sort-Object -Unique
     )
@@ -738,7 +849,7 @@ $summary = foreach ($detail in $details) {
         $allGaps = @($detail.NoCandidateReason) + $allGaps
     }
     $allWarnings = @(
-        $warningCandidates.Warnings |
+        $recommendedCandidate.Warnings |
             ForEach-Object { $_ } |
             Sort-Object -Unique
     )
@@ -751,6 +862,9 @@ $summary = foreach ($detail in $details) {
         Zone                    = $detail.Vm.Zone
         OsType                  = $detail.Vm.OsType
         CurrentSku              = $detail.Vm.CurrentSku
+        ReadinessStatus         = $detail.ReadinessStatus
+        RecommendedTargetSku    = $detail.RecommendedTargetSku
+        RequiredActions         = ($detail.RequiredActions -join '; ')
         GuestCheck              = $detail.GuestReadiness.Status
         CompatibleCandidates    = ($compatible.Sku -join '; ')
         DirectResizeCandidates  = ($direct.Sku -join '; ')
@@ -764,26 +878,18 @@ $summary = foreach ($detail in $details) {
 $summary | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
 $details | ConvertTo-Json -Depth 20 | Set-Content -Path $jsonPath -Encoding utf8
 
-$errorCount = @($summary | Where-Object { $_.AssessmentError }).Count
-$readyCount = @(
-    $summary | Where-Object {
-        -not $_.AssessmentError -and $_.DirectResizeCandidates
-    }
+$errorCount = @($summary | Where-Object ReadinessStatus -eq 'AssessmentError').Count
+$readyCount = @($summary | Where-Object ReadinessStatus -eq 'ReadyToResize').Count
+$actionCount = @($summary | Where-Object ReadinessStatus -eq 'ReadyAfterActions').Count
+$blockedCount = @(
+    $summary | Where-Object { $_.ReadinessStatus -in @('Blocked', 'NoTargetFound') }
 ).Count
-$deallocateCount = @(
-    $summary | Where-Object {
-        -not $_.AssessmentError -and
-        $_.CompatibleCandidates -and
-        -not $_.DirectResizeCandidates
-    }
-).Count
-$blockedCount = $summary.Count - $readyCount - $deallocateCount - $errorCount
 
 Write-Host ''
 Write-Host 'Assessment complete.' -ForegroundColor Green
-Write-Host "  Direct compatible resize available : $readyCount"
-Write-Host "  Compatible after placement review  : $deallocateCount"
-Write-Host "  No compatible candidate identified : $blockedCount"
+Write-Host "  Ready to resize                     : $readyCount"
+Write-Host "  Ready after required actions        : $actionCount"
+Write-Host "  Blocked or no target identified     : $blockedCount"
 Write-Host "  Assessment errors                   : $errorCount"
 Write-Host "  Summary CSV                         : $csvPath"
 Write-Host "  Detailed JSON                       : $jsonPath"
